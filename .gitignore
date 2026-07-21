@@ -10,6 +10,7 @@ __pycache__/
 
 # Logs
 *.log
+logs/
 
 # VS Code
 .vscode/
@@ -22,3 +23,6 @@ datasets/*.csv
 
 # Temporary
 temp/
+
+# Received files (file transfer output - not source code)
+received_files/

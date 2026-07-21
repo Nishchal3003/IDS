@@ -230,10 +230,15 @@ def validate_file_for_transfer(path: str) -> Path:
     """
     Validate that *path* exists, is a file, and is within the size limit.
 
+    Surrounding whitespace and quotation marks are stripped automatically,
+    so paths pasted from Windows Explorer (which wraps them in double-quotes)
+    are handled correctly without the user having to remove the quotes.
+
     Parameters
     ----------
     path : str
-        Absolute or relative path to the file.
+        Absolute or relative path to the file.  Surrounding ``"`` or ``'``
+        characters are stripped before resolution.
 
     Returns
     -------
@@ -249,6 +254,10 @@ def validate_file_for_transfer(path: str) -> Path:
     ValueError
         If the file exceeds ``MAX_FILE_SIZE``.
     """
+    # Strip surrounding whitespace and quotation marks that Windows
+    # sometimes adds when a user copies a path from Explorer or a prompt.
+    path = path.strip().strip('"').strip("'").strip()
+
     p = Path(path).resolve()
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")

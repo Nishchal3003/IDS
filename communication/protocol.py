@@ -276,3 +276,53 @@ def recv_frame(sock) -> Optional[Frame]:
         payload=payload,
         extra=extra,
     )
+
+
+def decode_frame_bytes(data: bytes) -> Optional[Frame]:
+    """
+    Decode a complete frame from an in-memory byte string.
+
+    Unlike ``recv_frame()`` which reads from a socket, this function
+    parses a byte string that already contains a complete frame.  It is
+    used by ``BrowserSession.send()`` to inspect frames that the server
+    is about to broadcast, so the WebSocket bridge can forward them to
+    browser clients in JSON form.
+
+    Parameters
+    ----------
+    data : bytes
+        Complete encoded frame (output of ``build_frame``).
+
+    Returns
+    -------
+    Frame | None
+        ``None`` if the data is malformed or the prefix is missing.
+    """
+    try:
+        prefix_bytes = HEADER_PREFIX.encode(ENCODING)
+        delim_bytes  = HEADER_DELIM.encode(ENCODING)
+
+        if not data.startswith(prefix_bytes):
+            return None
+
+        delim_pos = data.index(delim_bytes)
+        json_part = data[len(prefix_bytes):delim_pos].decode(ENCODING)
+        header: dict = json.loads(json_part)
+
+        payload_start = delim_pos + len(delim_bytes)
+        payload: bytes = data[payload_start:]
+
+        msg_type = MsgType(header.get("msg_type", ""))
+        if msg_type == MsgType.FILE_CHUNK:
+            payload = base64.b64decode(payload)
+
+        return Frame(
+            msg_type  = msg_type,
+            sender    = header.get("sender", "unknown"),
+            timestamp = header.get("timestamp", time.time()),
+            payload   = payload,
+            extra     = header.get("extra", {}),
+        )
+    except Exception:
+        return None
+

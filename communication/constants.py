@@ -24,10 +24,14 @@ from enum import Enum
 # Network defaults  (can be overridden by config/network_config.py)
 # ---------------------------------------------------------------------------
 DEFAULT_HOST: str = "0.0.0.0"        # bind to all interfaces on the server
-DEFAULT_PORT: int = 5000              # primary TCP port
+DEFAULT_PORT: int = 5000              # primary TCP port (TLS)
+WEB_PORT: int     = 8080             # HTTP port — serves the browser client UI
+WS_PORT: int      = 8081             # WebSocket port — browser real-time comms
 BUFFER_SIZE: int  = 4096             # socket recv buffer  (bytes)
 ENCODING: str     = "utf-8"          # text encoding for all messages
 MAX_CLIENTS: int  = 10               # max simultaneous clients
+USE_TLS: bool     = True             # enable TLS on the TCP socket layer
+
 
 # ---------------------------------------------------------------------------
 # Timeouts  (seconds)

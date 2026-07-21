@@ -8,8 +8,15 @@ hard-code IPs, ports, or sizes anywhere else.
 """
 
 # ── Server binding ────────────────────────────────────────────────────────────
-HOST: str = "0.0.0.0"     # Bind to all interfaces  (server side)
-PORT: int = 5000           # Primary TCP port
+HOST: str    = "0.0.0.0"    # Bind to all interfaces  (server side)
+PORT: int    = 5000          # Primary TCP port  (TLS encrypted)
+WEB_PORT: int = 8080         # HTTP port  – serves browser client UI
+WS_PORT: int  = 8081         # WebSocket port – browser real-time comms
+
+# ── Security ──────────────────────────────────────────────────────────────────
+USE_TLS: bool = True         # Enable TLS on TCP sockets (requires certs/)
+
+
 
 # ── Protocol ──────────────────────────────────────────────────────────────────
 BUFFER_SIZE: int = 4096    # Socket recv buffer in bytes

@@ -25,4 +25,9 @@ datasets/*.csv
 temp/
 
 # Received files (file transfer output - not source code)
-received_files/
+received_files/
+
+# TLS certificates — private key MUST NOT be committed
+certs/server.key
+# certs/server.crt is intentionally NOT ignored (safe to share with clients)
+

@@ -49,6 +49,7 @@ from communication.constants import (
     RECONNECT_DELAY,
     SOCKET_TIMEOUT,
     TRUST_INITIAL,
+    USE_TLS,
 )
 from communication.logger import get_logger
 from communication.protocol import (
@@ -58,6 +59,7 @@ from communication.protocol import (
     build_text_frame,
     recv_frame,
 )
+from communication.tls import client_ssl_context
 from communication.utils import (
     format_size,
     get_file_chunks,
@@ -168,6 +170,33 @@ class NIDSClient:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(SOCKET_TIMEOUT)
                 sock.connect((self.server_host, self.server_port))
+
+                # Wrap with TLS if the server expects it
+                if USE_TLS:
+                    try:
+                        ssl_ctx = client_ssl_context(verify_cert=True)
+                        sock = ssl_ctx.wrap_socket(
+                            sock,
+                            server_hostname=self.server_host,
+                        )
+                        log.info("TLS handshake successful")
+                    except Exception as exc:
+                        log.warning(
+                            "TLS with cert verification failed (%s). "
+                            "Retrying without cert verification...", exc
+                        )
+                        # Reconnect and try without cert verification
+                        sock.close()
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(SOCKET_TIMEOUT)
+                        sock.connect((self.server_host, self.server_port))
+                        ssl_ctx = client_ssl_context(verify_cert=False)
+                        sock = ssl_ctx.wrap_socket(
+                            sock,
+                            server_hostname=self.server_host,
+                        )
+                        log.info("TLS connected (no cert verification)")
+
                 self._sock  = sock
                 self._alive = True
                 self._send_hello()

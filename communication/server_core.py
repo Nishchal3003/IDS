@@ -46,9 +46,11 @@ from communication.constants import (
     MsgType,
     SOCKET_TIMEOUT,
     TRUST_INITIAL,
+    USE_TLS,
 )
 from communication.logger import get_logger
 from communication.protocol import Frame, build_text_frame, build_frame, recv_frame
+from communication.tls import certs_exist, server_ssl_context
 from communication.utils import (
     format_size,
     get_file_chunks,
@@ -314,9 +316,24 @@ class NIDSServer:
         self._server_sock: Optional[socket.socket] = None
         self._running: bool = False
 
-        # sessions dict:  conn_fileno → ClientSession
+        # TLS context — created once if certs are available
+        self._ssl_ctx = None
+        if USE_TLS:
+            if certs_exist():
+                self._ssl_ctx = server_ssl_context()
+                log.info("TLS enabled — all TCP connections will be encrypted")
+            else:
+                log.warning(
+                    "USE_TLS=True but certs not found. "
+                    "Run: python -m communication.generate_certs"
+                )
+
+        # sessions dict:  conn_fileno → ClientSession (or BrowserSession)
+        # BrowserSessions use negative keys (e.g. -1, -2, ...) so they
+        # never collide with real OS file descriptors (always >= 0).
         self._sessions: dict[int, ClientSession] = {}
         self._sessions_lock: threading.Lock = threading.Lock()
+        self._browser_session_counter: int = 0  # decrements for each browser session
 
     # ------------------------------------------------------------------
     # Public read-only view of sessions
@@ -344,13 +361,14 @@ class NIDSServer:
         self._running = True
 
         log.info(
-            "NIDS Server listening on %s:%s (max %d clients)",
+            "NIDS Server listening on %s:%s (max %d clients) | TLS: %s",
             self._host, self._port, MAX_CLIENTS,
+            "ON" if self._ssl_ctx else "OFF",
         )
         print(f"\n{'='*60}")
         print(f"  NIDS Private Network Server")
-        print(f"  Listening on  : {self._host}:{self._port}")
-        print(f"  Max clients   : {MAX_CLIENTS}")
+        print(f"  TCP  (Python clients) : {self._host}:{self._port}  |  TLS: {'ON' if self._ssl_ctx else 'OFF'}")
+        print(f"  Max clients           : {MAX_CLIENTS}")
         print(f"  Press Ctrl+C to stop")
         print(f"{'='*60}\n")
 
@@ -402,6 +420,19 @@ class NIDSServer:
                 session = ClientSession(conn, addr, self)
                 self._sessions[conn.fileno()] = session
 
+            # Wrap with TLS AFTER the session is created so that the
+            # handshake happens in the session thread, not the accept thread.
+            if self._ssl_ctx:
+                try:
+                    tls_conn = self._ssl_ctx.wrap_socket(conn, server_side=True)
+                    session._conn = tls_conn   # replace the raw socket
+                except Exception as exc:
+                    log.error("TLS handshake failed for %s:%s — %s", *addr, exc)
+                    with self._sessions_lock:
+                        self._sessions.pop(conn.fileno(), None)
+                    conn.close()
+                    continue
+
             thread = threading.Thread(
                 target=session.handle,
                 daemon=True,
@@ -439,7 +470,9 @@ class NIDSServer:
     # ------------------------------------------------------------------
     def remove_session(self, session: "ClientSession") -> None:
         """Remove a disconnected session and notify remaining peers."""
-        fd = session._conn.fileno()
+        fd = getattr(session, "_browser_key", None)
+        if fd is None:
+            fd = session._conn.fileno()
         with self._sessions_lock:
             self._sessions.pop(fd, None)
 
@@ -454,6 +487,35 @@ class NIDSServer:
             "Session removed: %s | Active clients: %d",
             session.alias, len(self._sessions),
         )
+
+    def register_browser_session(self, session: "ClientSession") -> int:
+        """
+        Register a BrowserSession in the shared session registry.
+
+        Browser sessions use negative integer keys so they never clash
+        with real OS file descriptors (which are always >= 0).
+
+        Parameters
+        ----------
+        session : BrowserSession
+            The session object to register.
+
+        Returns
+        -------
+        int
+            The unique negative key assigned to this session.
+        """
+        with self._sessions_lock:
+            self._browser_session_counter -= 1
+            key = self._browser_session_counter
+            session._browser_key = key
+            self._sessions[key] = session
+        log.info("Browser session registered: key=%d  alias=%s", key, session.alias)
+        return key
+
+    def unregister_browser_session(self, session: "ClientSession") -> None:
+        """Remove a BrowserSession and broadcast PEER_LEAVE."""
+        self.remove_session(session)
 
     # ------------------------------------------------------------------
     # Heartbeat

@@ -358,6 +358,7 @@ class NIDSServer:
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((self._host, self._port))
         self._server_sock.listen(MAX_CLIENTS)
+        self._server_sock.settimeout(1.0)
         self._running = True
 
         log.info(
@@ -398,8 +399,8 @@ class NIDSServer:
         while self._running:
             try:
                 conn, addr = self._server_sock.accept()
-            except OSError:
-                break   # socket was closed by stop()
+            except socket.timeout:
+                continue   # socket was closed by stop()
 
             with self._sessions_lock:
                 if len(self._sessions) >= MAX_CLIENTS:

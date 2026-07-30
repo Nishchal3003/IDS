@@ -178,11 +178,27 @@ class BrowserSession:
         payload = _frame_to_browser_json(frame)
         if payload is None:
             return True   # silently ignore irrelevant frame types
+        json_str = json.dumps(payload)
         try:
-            asyncio.run_coroutine_threadsafe(
-                self._ws.send(json.dumps(payload)),
-                self._loop,
-            ).result(timeout=5)
+            # Detect whether we are being called from WITHIN the asyncio
+            # event loop (e.g. from _handle_chat → server.broadcast()) or
+            # from an external thread (TCP session thread, heartbeat thread).
+            #
+            # If we're on the same loop and call .result() we would deadlock
+            # because .result() blocks the very loop it's waiting on.
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+
+            if running_loop is self._loop:
+                # Same event loop — schedule as a fire-and-forget task.
+                self._loop.create_task(self._ws.send(json_str))
+            else:
+                # External thread — safe to block.
+                asyncio.run_coroutine_threadsafe(
+                    self._ws.send(json_str), self._loop
+                ).result(timeout=5)
             return True
         except Exception as exc:
             log.warning("BrowserSession.send failed for %s: %s", self.alias, exc)
@@ -237,16 +253,21 @@ class BrowserSession:
         text = data.get("text", "").strip()
         if not text:
             return
-        log.info("[CHAT] %s (browser) → broadcast: %s", self.alias, text)
+        log.info("[CHAT] %s (browser) -> broadcast: %s", self.alias, text)
+        ts = timestamp_to_str(time.time())
         relay = build_text_frame(
             MsgType.BROADCAST, self.alias, text,
             extra={
                 "from" : self.alias,
-                "time" : timestamp_to_str(time.time()),
+                "time" : ts,
             },
         )
-        # Send to all (including this browser session via broadcast)
-        self._server.broadcast(relay, exclude=None)
+        # Broadcast to everyone EXCEPT self (avoids the event-loop deadlock
+        # where send() is called from within the same asyncio loop).
+        self._server.broadcast(relay, exclude=self)
+        # Echo the message back to self directly with await (safe, no deadlock).
+        echo = {"type": "BROADCAST", "from": self.alias, "text": text, "time": ts}
+        await self._ws.send(json.dumps(echo))
 
     async def _handle_file(self, data: dict) -> None:
         filename = data.get("filename", "upload")
@@ -320,6 +341,8 @@ class BrowserSession:
                 elif msg_type == "DISCONNECT":
                     await self._handle_disconnect()
                     break
+                elif msg_type == "PONG":
+                    pass  # valid keep-alive reply, no action needed
                 else:
                     log.warning("Unknown browser msg_type: %s", msg_type)
 

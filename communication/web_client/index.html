@@ -392,8 +392,12 @@
       <input id="inp-ip" type="text" placeholder="192.168.x.x" autocomplete="off" />
     </div>
     <div class="form-group">
+      <label>Network Password</label>
+      <input id="inp-psk" type="password" placeholder="Network password" autocomplete="off" />
+    </div>
+    <div class="form-group">
       <label>WebSocket Port</label>
-      <input id="inp-port" type="number" value="8081" />
+      <input id="inp-port" type="number" value="8444" />
     </div>
     <div id="login-error"></div>
     <button id="btn-connect">Connect</button>
@@ -469,6 +473,7 @@
   const loginOverlay   = document.getElementById('login-overlay');
   const inpAlias       = document.getElementById('inp-alias');
   const inpIp          = document.getElementById('inp-ip');
+  const inpPsk         = document.getElementById('inp-psk');
   const inpPort        = document.getElementById('inp-port');
   const loginError     = document.getElementById('login-error');
   const btnConnect     = document.getElementById('btn-connect');
@@ -495,16 +500,30 @@
   /* ── Auto-detect server IP ────────────────────────────────── */
   inpIp.value = window.location.hostname || '';
 
+  /* ── HMAC-SHA256 auth token (Web Crypto API) ──────────────── */
+  async function computeAuthToken(psk, alias) {
+    if (!psk) return '';
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw', enc.encode(psk),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`NIDS-AUTH:${alias}`));
+    return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2,'0')).join('');
+  }
+
   /* ── Connect ──────────────────────────────────────────────── */
   btnConnect.addEventListener('click', connect);
-  inpAlias.addEventListener('keydown', e => { if (e.key === 'Enter') inpPort.focus(); });
-  inpIp.addEventListener('keydown',   e => { if (e.key === 'Enter') inpPort.focus(); });
-  inpPort.addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+  inpAlias.addEventListener('keydown', e => { if (e.key === 'Enter') inpPsk.focus(); });
+  inpPsk.addEventListener('keydown',   e => { if (e.key === 'Enter') inpPort.focus(); });
+  inpIp.addEventListener('keydown',    e => { if (e.key === 'Enter') inpPort.focus(); });
+  inpPort.addEventListener('keydown',  e => { if (e.key === 'Enter') connect(); });
 
-  function connect() {
+  async function connect() {
     const alias = inpAlias.value.trim();
     const ip    = inpIp.value.trim();
-    const port  = parseInt(inpPort.value) || 8081;
+    const psk   = inpPsk.value;
+    const port  = parseInt(inpPort.value) || 8444;
 
     if (!alias)          { showLoginError('Enter a device alias.'); return; }
     if (!/^[A-Za-z0-9_-]{2,20}$/.test(alias)) {
@@ -518,7 +537,12 @@
     btnConnect.textContent = 'Connecting…';
 
     myAlias = alias;
-    const url = `ws://${ip}:${port}`;
+
+    // Always use wss:// (WSS = WebSocket Secure over TLS)
+    const url = `wss://${ip}:${port}`;
+
+    // Compute HMAC auth token from password
+    const authToken = await computeAuthToken(psk, alias);
 
     try {
       ws = new WebSocket(url);
@@ -529,7 +553,7 @@
     }
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'HELLO', alias }));
+      ws.send(JSON.stringify({ type: 'HELLO', alias, auth_token: authToken }));
     };
 
     ws.onmessage = e => {
@@ -538,7 +562,7 @@
     };
 
     ws.onerror = () => {
-      showLoginError(`Cannot connect to ws://${ip}:${port}. Is the server running?`);
+      showLoginError(`Cannot connect to wss://${ip}:${port}. Is the server running?`);
       resetConnectBtn();
       ws = null;
     };

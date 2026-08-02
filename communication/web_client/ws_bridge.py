@@ -5,6 +5,18 @@ WebSocket bridge that connects browser clients to the NIDSServer session
 registry, enabling real-time bidirectional communication without any
 client-side installation.
 
+Security (Phase 1 Enhancement)
+-------------------------------
+The WebSocket server now uses WSS (WebSocket Secure = WS over TLS) using
+the same certificate as the TCP server (certs/server.crt + server.crt.key).
+
+Browsers connect to ``wss://server-ip:8444`` instead of ``ws://``.
+All traffic is AES-256 encrypted — identical protection to the TCP channel.
+
+Authentication: browser clients must include a HMAC-SHA256 auth token in
+their HELLO message (computed from the network PSK + alias).  The server
+rejects the connection if the token is wrong or missing.
+
 Architecture
 ------------
 ::
@@ -72,6 +84,11 @@ from communication.constants import (
 )
 from communication.logger import get_logger
 from communication.protocol import decode_frame_bytes, build_text_frame
+from communication.security import (
+    verify_auth_token,
+    server_ssl_context,
+    certs_exist,
+)
 from communication.utils import format_size, timestamp_to_str
 
 if TYPE_CHECKING:
@@ -231,6 +248,27 @@ class BrowserSession:
         if alias in existing:
             alias = f"{alias}-{self.address[1]}"
         self.alias = alias
+
+        # ── PSK authentication ────────────────────────────────────────
+        try:
+            from config.network_config import NETWORK_PSK
+        except ImportError:
+            NETWORK_PSK = ""
+
+        if NETWORK_PSK:
+            auth_token = data.get("auth_token", "")
+            if not verify_auth_token(NETWORK_PSK, alias, auth_token):
+                log.warning(
+                    "Browser auth FAILED for alias '%s' from %s",
+                    alias, self.address[0],
+                )
+                await self._ws.send(json.dumps({
+                    "type"   : "ERROR",
+                    "message": "Authentication failed. Wrong network password.",
+                }))
+                self._alive = False
+                return
+
         log.info("Browser HELLO from %s (%s)", self.alias, self.address[0])
 
         peers = [s.alias for s in self._server.sessions.values() if s is not self]
@@ -359,10 +397,8 @@ class BrowserSession:
 # ---------------------------------------------------------------------------
 def start_ws_server(server: "NIDSServer", host: str, port: int) -> None:
     """
-    Start the WebSocket server in a background daemon thread.
-
-    This function is non-blocking — it starts a new thread that owns
-    an asyncio event loop and runs the ``websockets.serve()`` loop.
+    Start the WebSocket server (WSS if certs available, WS otherwise)
+    in a background daemon thread.
 
     Parameters
     ----------
@@ -371,7 +407,7 @@ def start_ws_server(server: "NIDSServer", host: str, port: int) -> None:
     host : str
         Interface to bind (e.g. ``"0.0.0.0"``).
     port : int
-        WebSocket port (e.g. ``8081``).
+        WebSocket port (e.g. ``8444`` for WSS).
     """
     try:
         import websockets
@@ -382,13 +418,28 @@ def start_ws_server(server: "NIDSServer", host: str, port: int) -> None:
         )
         return
 
+    # ── Choose SSL context (WSS) or None (plain WS) ───────────────────
+    ssl_ctx = None
+    if certs_exist():
+        try:
+            ssl_ctx = server_ssl_context()
+            log.info("WebSocket server will use WSS (TLS encrypted)")
+        except Exception as exc:
+            log.warning("Cannot load TLS for WSS, falling back to plain WS: %s", exc)
+    else:
+        log.warning(
+            "TLS certs not found — WebSocket will use plain ws:// (NOT encrypted). "
+            "Run: python -m communication.generate_certs"
+        )
+
     async def _handler(websocket):
         session = BrowserSession(websocket, server, asyncio.get_event_loop())
         await session.run()
 
     async def _serve():
-        log.info("WebSocket server starting on %s:%d", host, port)
-        async with websockets.serve(_handler, host, port):
+        proto = "wss" if ssl_ctx else "ws"
+        log.info("WebSocket server starting on %s://%s:%d", proto, host, port)
+        async with websockets.serve(_handler, host, port, ssl=ssl_ctx):
             await asyncio.Future()  # run forever
 
     def _thread_main():
@@ -401,4 +452,5 @@ def start_ws_server(server: "NIDSServer", host: str, port: int) -> None:
 
     thread = threading.Thread(target=_thread_main, daemon=True, name="ws-server")
     thread.start()
-    log.info("WebSocket server thread started (port %d)", port)
+    proto = "WSS" if ssl_ctx else "WS"
+    log.info("%s server thread started (port %d)", proto, port)

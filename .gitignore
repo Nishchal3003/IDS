@@ -18,8 +18,11 @@ logs/
 # Streamlit
 .streamlit/
 
-# Dataset
-datasets/*.csv
+# Dataset — large CSVs and PCAPs should not be in version control
+datasets/**/*.csv
+datasets/**/*.pcap
+datasets/captures/
+datasets/cicids2017/
 
 # Temporary
 temp/

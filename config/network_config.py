@@ -10,11 +10,19 @@ hard-code IPs, ports, or sizes anywhere else.
 # ── Server binding ────────────────────────────────────────────────────────────
 HOST: str    = "0.0.0.0"    # Bind to all interfaces  (server side)
 PORT: int    = 5000          # Primary TCP port  (TLS encrypted)
-WEB_PORT: int = 8080         # HTTP port  – serves browser client UI
-WS_PORT: int  = 8081         # WebSocket port – browser real-time comms
+WEB_PORT: int  = 8080         # HTTP port  (kept for internal redirect)
+WS_PORT: int   = 8081         # WS port   (kept for reference)
+HTTPS_PORT: int = 8443        # HTTPS port – serves browser client UI (TLS)
+WSS_PORT: int   = 8444        # WSS port  – browser WebSocket over TLS
 
 # ── Security ──────────────────────────────────────────────────────────────────
 USE_TLS: bool = True         # Enable TLS on TCP sockets (requires certs/)
+
+# ── Security — Authentication & Integrity ─────────────────────────────────────
+# Set NETWORK_PSK to a non-empty string to require a password to join.
+# Leave empty ("") to disable auth (open network, backward compatible).
+NETWORK_PSK: str   = "nids-secure-2026"   # Pre-shared key for HMAC auth
+HMAC_ALGORITHM: str = "sha256"             # Algorithm used for auth + integrity
 
 
 

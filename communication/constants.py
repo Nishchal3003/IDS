@@ -82,6 +82,7 @@ class MsgType(str, Enum):
     FILE_ACK    = "FILE_ACK"     # receiver acknowledges a chunk
     FILE_DONE   = "FILE_DONE"    # sender signals end of file transfer
     FILE_ERROR  = "FILE_ERROR"   # either side reports a transfer failure
+    FILE_INCOMING = "FILE_INCOMING"  # server relays a complete file to a peer
 
     # Device / peer management
     PEER_LIST   = "PEER_LIST"    # server → client  : current online peers

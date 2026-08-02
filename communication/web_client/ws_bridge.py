@@ -142,6 +142,16 @@ def _frame_to_browser_json(frame) -> Optional[dict]:
         return {"type": "PING"}
     if frame.msg_type == MsgType.PEER_LIST:
         return {"type": "PEER_LIST", "peers": frame.extra.get("peers", [])}
+    if frame.msg_type == MsgType.FILE_INCOMING:
+        # Relay a file shared by a TCP or browser peer.
+        # The payload is the raw base64-encoded file bytes.
+        return {
+            "type"    : "FILE_INCOMING",
+            "from"    : frame.extra.get("from", frame.sender),
+            "filename": frame.extra.get("file_name", "file"),
+            "size"    : frame.extra.get("file_size", 0),
+            "data"    : frame.payload.decode("ascii"),  # already base64
+        }
     # All other frame types are silently dropped (not relevant to browser)
     return None
 
@@ -171,6 +181,7 @@ class BrowserSession:
         self._server    = server
         self._loop      = loop
         self._browser_key: int = 0   # set by register_browser_session()
+        self._is_browser: bool = True  # used by server_core to distinguish from TCP
 
         # Mirrors ClientSession public attributes
         self.alias: str          = f"browser@{websocket.remote_address[0]}"
@@ -326,21 +337,79 @@ class BrowserSession:
         RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
         dest = RECEIVED_DIR / filename
         dest.write_bytes(raw)
-        log.info("[FILE] Browser %s sent '%s' (%s)", self.alias, filename, format_size(len(raw)))
+        file_size = len(raw)
+        log.info("[FILE] Browser %s sent '%s' (%s) — relaying to peers", self.alias, filename, format_size(file_size))
 
         # ACK back to sender
         await self._ws.send(json.dumps({
             "type"   : "ACK",
-            "message": f"File '{filename}' received ({format_size(len(raw))})",
+            "message": f"File '{filename}' received ({format_size(file_size)})",
         }))
 
-        # Notify other clients that a file was uploaded
+        # ── Relay to all other sessions ───────────────────────────────────
+        import math as _math
+        from communication.constants import FILE_CHUNK_SIZE
+        from communication.protocol import build_file_chunk_frame, build_frame
+
+        other_sessions = [s for s in self._server.sessions.values() if s is not self]
+        tcp_peers     = [s for s in other_sessions if not hasattr(s, "_is_browser")]
+        browser_peers = [s for s in other_sessions if hasattr(s, "_is_browser")]
+
+        total_chunks = _math.ceil(file_size / FILE_CHUNK_SIZE) or 1
+
+        # TCP clients: FILE_META → FILE_CHUNK × N → FILE_DONE
+        if tcp_peers:
+            meta = build_text_frame(
+                MsgType.FILE_META, self.alias, filename,
+                extra={
+                    "file_name"   : filename,
+                    "file_size"   : file_size,
+                    "total_chunks": total_chunks,
+                    "from"        : self.alias,
+                },
+            )
+            for s in tcp_peers:
+                s.send(meta)
+
+            for idx in range(total_chunks):
+                start = idx * FILE_CHUNK_SIZE
+                chunk_frame = build_file_chunk_frame(
+                    self.alias,
+                    raw[start: start + FILE_CHUNK_SIZE],
+                    file_name=filename,
+                    chunk_index=idx,
+                    total_chunks=total_chunks,
+                )
+                for s in tcp_peers:
+                    s.send(chunk_frame)
+
+            done_f = build_text_frame(MsgType.FILE_DONE, self.alias, filename)
+            for s in tcp_peers:
+                s.send(done_f)
+
+        # Browser peers: single FILE_INCOMING frame with base64 payload
+        if browser_peers:
+            incoming = build_frame(
+                MsgType.FILE_INCOMING, self.alias,
+                b64data.encode("ascii"),   # already base64
+                extra={"file_name": filename, "file_size": file_size, "from": self.alias},
+            )
+            for s in browser_peers:
+                s.send(incoming)
+
+        # Notify all (including sender) in chat
         notice = build_text_frame(
             MsgType.BROADCAST, "server",
-            f"{self.alias} uploaded '{filename}' ({format_size(len(raw))})",
+            f"{self.alias} shared '{filename}' ({format_size(file_size)}) — available to all peers",
             extra={"from": "server", "time": timestamp_to_str(time.time())},
         )
         self._server.broadcast(notice, exclude=self)
+        # Echo notice to self (browser)
+        await self._ws.send(json.dumps({
+            "type": "BROADCAST", "from": "server",
+            "text": f"{self.alias} shared '{filename}' ({format_size(file_size)}) — available to all peers",
+            "time": timestamp_to_str(time.time()),
+        }))
 
     async def _handle_list_peers(self) -> None:
         peers = [s.alias for s in self._server.sessions.values() if s is not self]

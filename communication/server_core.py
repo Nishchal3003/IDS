@@ -47,9 +47,12 @@ from communication.constants import (
     SOCKET_TIMEOUT,
     TRUST_INITIAL,
     USE_TLS,
+    FILE_CHUNK_SIZE,
 )
 from communication.logger import get_logger
-from communication.protocol import Frame, build_text_frame, build_frame, recv_frame
+from communication.protocol import (
+    Frame, build_text_frame, build_frame, recv_frame, build_file_chunk_frame,
+)
 from communication.tls import certs_exist, server_ssl_context
 from communication.utils import (
     format_size,
@@ -278,18 +281,95 @@ class ClientSession:
             log.warning("%s sent FILE_DONE without FILE_META", self.alias)
             return
         state = self._file_state
+        self._file_state = None   # clear early so re-entrant calls are safe
+
+        file_data = bytes(state.buffer)
+        file_size = len(file_data)
+
+        # 1. Save on server ─────────────────────────────────────────────
         RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
         dest = RECEIVED_DIR / state.file_name
-        dest.write_bytes(bytes(state.buffer))
+        dest.write_bytes(file_data)
         log.info(
-            "[FILE] Saved '%s' (%s) from %s",
-            state.file_name, format_size(len(state.buffer)), self.alias,
+            "[FILE] Saved '%s' (%s) from %s → relaying to %d peer(s)",
+            state.file_name, format_size(file_size), self.alias,
+            len(self._server.sessions) - 1,
         )
-        done_ack = build_text_frame(
+
+        # Acknowledge receipt to the sender
+        self.send(build_text_frame(
             MsgType.ACK, "server", f"File '{state.file_name}' received"
+        ))
+
+        # 2. Relay to all other sessions ────────────────────────────────
+        other_sessions = [
+            s for s in self._server.sessions.values() if s is not self
+        ]
+        if not other_sessions:
+            return
+
+        # Split peers into TCP vs browser (BrowserSession has _browser_key)
+        tcp_peers     = [s for s in other_sessions if not hasattr(s, "_is_browser")]
+        browser_peers = [s for s in other_sessions if hasattr(s, "_is_browser")]
+
+        total_chunks = math.ceil(file_size / FILE_CHUNK_SIZE) or 1
+
+        # ── TCP clients: use FILE_META → FILE_CHUNK × N → FILE_DONE ────
+        if tcp_peers:
+            meta_frame = build_text_frame(
+                MsgType.FILE_META, self.alias, state.file_name,
+                extra={
+                    "file_name"   : state.file_name,
+                    "file_size"   : file_size,
+                    "total_chunks": total_chunks,
+                    "from"        : self.alias,
+                },
+            )
+            for s in tcp_peers:
+                s.send(meta_frame)
+
+            for chunk_idx in range(total_chunks):
+                start = chunk_idx * FILE_CHUNK_SIZE
+                end   = start + FILE_CHUNK_SIZE
+                chunk_frame = build_file_chunk_frame(
+                    self.alias,
+                    file_data[start:end],
+                    file_name=state.file_name,
+                    chunk_index=chunk_idx,
+                    total_chunks=total_chunks,
+                )
+                for s in tcp_peers:
+                    s.send(chunk_frame)
+
+            done_frame = build_text_frame(
+                MsgType.FILE_DONE, self.alias, state.file_name
+            )
+            for s in tcp_peers:
+                s.send(done_frame)
+
+        # ── Browser clients: single FILE_INCOMING frame (base64 payload)
+        if browser_peers:
+            import base64 as _b64
+            incoming_frame = build_frame(
+                MsgType.FILE_INCOMING, self.alias,
+                _b64.b64encode(file_data),
+                extra={
+                    "file_name": state.file_name,
+                    "file_size": file_size,
+                    "from"     : self.alias,
+                },
+            )
+            for s in browser_peers:
+                s.send(incoming_frame)
+
+        # 3. Notify all peers (including sender) in chat
+        notify = build_text_frame(
+            MsgType.BROADCAST, "server",
+            f"{self.alias} shared '{state.file_name}' ({format_size(file_size)}) — available to all peers",
+            extra={"from": "server", "time": timestamp_to_str(time.time())},
         )
-        self.send(done_ack)
-        self._file_state = None
+        self._server.broadcast(notify)
+        log.info("[FILE] Relay of '%s' complete.", state.file_name)
 
     def _handle_disconnect(self, frame: Frame) -> None:
         log.info("%s sent DISCONNECT: %s", self.alias, frame.text)

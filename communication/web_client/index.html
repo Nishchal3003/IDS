@@ -184,6 +184,23 @@
     }
     .msg.error-msg { background: rgba(248,81,73,.1); border: 1px solid rgba(248,81,73,.3); align-self: center; color: var(--danger); }
     .msg.ack-msg   { background: rgba(63,185,80,.08); border: 1px solid rgba(63,185,80,.25); align-self: center; color: var(--accent2); font-size: .82rem; }
+    /* ── File incoming card ──────────────────────────────────── */
+    .file-incoming-card {
+      display: flex; align-items: center; gap: 12px;
+      background: rgba(88,166,255,.08); border: 1px solid rgba(88,166,255,.25);
+      border-radius: 8px; padding: 10px 14px; margin-top: 6px;
+    }
+    .fi-icon  { font-size: 1.8rem; }
+    .fi-info  { flex: 1; min-width: 0; }
+    .fi-name  { font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .fi-size  { font-size: .78rem; color: var(--text-dim); margin-top: 2px; }
+    .fi-btn   {
+      display: inline-block; padding: 6px 14px; border-radius: 6px;
+      background: var(--accent); color: #000; font-weight: 700; font-size: .82rem;
+      text-decoration: none; white-space: nowrap;
+      transition: background .2s;
+    }
+    .fi-btn:hover { background: #79b8ff; }
 
     /* ── Input bar ──────────────────────────────────────────── */
     .input-bar {
@@ -847,6 +864,39 @@
     if (b < 1048576)  return (b/1024).toFixed(1) + ' KB';
     return (b/1048576).toFixed(2) + ' MB';
   }
+  /* ── Receive file from any peer (creates download card) ────── */
+  function receiveFile(msg) {
+    try {
+      // Decode base64 → Uint8Array → Blob
+      const binary = atob(msg.data);
+      const bytes  = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes]);
+      const url  = URL.createObjectURL(blob);
+
+      const el = document.createElement('div');
+      el.className = 'msg incoming file-card-msg';
+      el.innerHTML =
+        `<div class="meta">
+           <span class="sender">📎 ${escHtml(msg.from)}</span>
+           <span>${now()}</span>
+         </div>
+         <div class="file-incoming-card">
+           <div class="fi-icon">📄</div>
+           <div class="fi-info">
+             <div class="fi-name">${escHtml(msg.filename)}</div>
+             <div class="fi-size">${fmtSize(msg.size || bytes.length)}</div>
+           </div>
+           <a class="fi-btn" href="${url}" download="${escHtml(msg.filename)}">
+             ⬇ Download
+           </a>
+         </div>`;
+      appendMsg(el);
+    } catch(e) {
+      appendError(`Could not decode incoming file '${msg.filename}': ${e}`);
+    }
+  }
+
 </script>
 </body>
 </html>

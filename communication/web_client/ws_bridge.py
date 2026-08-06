@@ -340,13 +340,13 @@ class BrowserSession:
         file_size = len(raw)
         log.info("[FILE] Browser %s sent '%s' (%s) — relaying to peers", self.alias, filename, format_size(file_size))
 
-        # ACK back to sender
+        # ACK back to sender immediately (before relay)
         await self._ws.send(json.dumps({
             "type"   : "ACK",
-            "message": f"File '{filename}' received ({format_size(file_size)})",
+            "message": f"File '{filename}' received ({format_size(file_size)}) — relaying to peers",
         }))
 
-        # ── Relay to all other sessions ───────────────────────────────────
+        # ── Gather relay targets ──────────────────────────────────────────
         import math as _math
         from communication.constants import FILE_CHUNK_SIZE
         from communication.protocol import build_file_chunk_frame, build_frame
@@ -354,40 +354,41 @@ class BrowserSession:
         other_sessions = [s for s in self._server.sessions.values() if s is not self]
         tcp_peers     = [s for s in other_sessions if not hasattr(s, "_is_browser")]
         browser_peers = [s for s in other_sessions if hasattr(s, "_is_browser")]
+        total_chunks  = _math.ceil(file_size / FILE_CHUNK_SIZE) or 1
 
-        total_chunks = _math.ceil(file_size / FILE_CHUNK_SIZE) or 1
-
-        # TCP clients: FILE_META → FILE_CHUNK × N → FILE_DONE
+        # ── Build all TCP frames first (CPU-bound, but fast) ─────────────
+        tcp_frames = []
         if tcp_peers:
-            meta = build_text_frame(
+            tcp_frames.append(build_text_frame(
                 MsgType.FILE_META, self.alias, filename,
-                extra={
-                    "file_name"   : filename,
-                    "file_size"   : file_size,
-                    "total_chunks": total_chunks,
-                    "from"        : self.alias,
-                },
-            )
-            for s in tcp_peers:
-                s.send(meta)
-
+                extra={"file_name": filename, "file_size": file_size,
+                       "total_chunks": total_chunks, "from": self.alias},
+            ))
             for idx in range(total_chunks):
                 start = idx * FILE_CHUNK_SIZE
-                chunk_frame = build_file_chunk_frame(
+                tcp_frames.append(build_file_chunk_frame(
                     self.alias,
                     raw[start: start + FILE_CHUNK_SIZE],
                     file_name=filename,
                     chunk_index=idx,
                     total_chunks=total_chunks,
-                )
-                for s in tcp_peers:
-                    s.send(chunk_frame)
+                ))
+            tcp_frames.append(build_text_frame(MsgType.FILE_DONE, self.alias, filename))
 
-            done_f = build_text_frame(MsgType.FILE_DONE, self.alias, filename)
-            for s in tcp_peers:
-                s.send(done_f)
+        # ── TCP relay: run in executor so we don’t block the event loop ──
+        def _relay_tcp():
+            for frame_bytes in tcp_frames:
+                for peer in list(tcp_peers):   # copy to avoid mutation
+                    try:
+                        peer.send(frame_bytes)
+                    except Exception as exc:
+                        log.warning("[FILE] TCP relay to %s failed: %s", peer.alias, exc)
 
-        # Browser peers: single FILE_INCOMING frame with base64 payload
+        if tcp_frames:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _relay_tcp)
+
+        # ── Browser relay: single FILE_INCOMING frame ────────────────
         if browser_peers:
             incoming = build_frame(
                 MsgType.FILE_INCOMING, self.alias,
@@ -395,21 +396,27 @@ class BrowserSession:
                 extra={"file_name": filename, "file_size": file_size, "from": self.alias},
             )
             for s in browser_peers:
-                s.send(incoming)
+                try:
+                    s.send(incoming)
+                except Exception as exc:
+                    log.warning("[FILE] Browser relay to %s failed: %s",
+                                getattr(s, 'alias', '?'), exc)
 
-        # Notify all (including sender) in chat
+        # ── Broadcast notification in chat ──────────────────────────
         notice = build_text_frame(
             MsgType.BROADCAST, "server",
             f"{self.alias} shared '{filename}' ({format_size(file_size)}) — available to all peers",
             extra={"from": "server", "time": timestamp_to_str(time.time())},
         )
         self._server.broadcast(notice, exclude=self)
-        # Echo notice to self (browser)
+        # Echo notice back to self (the browser sender)
         await self._ws.send(json.dumps({
             "type": "BROADCAST", "from": "server",
             "text": f"{self.alias} shared '{filename}' ({format_size(file_size)}) — available to all peers",
             "time": timestamp_to_str(time.time()),
         }))
+        log.info("[FILE] Relay of '%s' complete. TCP=%d Browser=%d",
+                 filename, len(tcp_peers), len(browser_peers))
 
     async def _handle_list_peers(self) -> None:
         peers = [s.alias for s in self._server.sessions.values() if s is not self]
@@ -508,7 +515,15 @@ def start_ws_server(server: "NIDSServer", host: str, port: int) -> None:
     async def _serve():
         proto = "wss" if ssl_ctx else "ws"
         log.info("WebSocket server starting on %s://%s:%d", proto, host, port)
-        async with websockets.serve(_handler, host, port, ssl=ssl_ctx):
+        # max_size=None removes the default 1MB message limit so that files
+        # up to MAX_FILE_SIZE (100MB as base64 ~ 133MB) can be sent by browsers.
+        async with websockets.serve(
+            _handler, host, port,
+            ssl=ssl_ctx,
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=60,
+        ):
             await asyncio.Future()  # run forever
 
     def _thread_main():

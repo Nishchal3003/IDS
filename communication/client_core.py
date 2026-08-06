@@ -375,16 +375,17 @@ class NIDSClient:
     # ------------------------------------------------------------------
     def _dispatch(self, frame: Frame) -> None:
         built_in_handlers = {
-            MsgType.WELCOME   : self._on_welcome,
-            MsgType.PING      : self._on_ping,
-            MsgType.PONG      : self._on_pong,
-            MsgType.PEER_JOIN : self._on_peer_join,
-            MsgType.PEER_LEAVE: self._on_peer_leave,
-            MsgType.FILE_ACK  : self._on_file_ack,
-            MsgType.FILE_META : self._on_file_meta,
-            MsgType.FILE_CHUNK: self._on_file_chunk,
-            MsgType.FILE_DONE : self._on_file_done,
-            MsgType.DISCONNECT: self._on_server_disconnect,
+            MsgType.WELCOME      : self._on_welcome,
+            MsgType.PING         : self._on_ping,
+            MsgType.PONG         : self._on_pong,
+            MsgType.PEER_JOIN    : self._on_peer_join,
+            MsgType.PEER_LEAVE   : self._on_peer_leave,
+            MsgType.FILE_ACK     : self._on_file_ack,
+            MsgType.FILE_META    : self._on_file_meta,
+            MsgType.FILE_CHUNK   : self._on_file_chunk,
+            MsgType.FILE_DONE    : self._on_file_done,
+            MsgType.FILE_INCOMING: self._on_file_incoming,  # fallback (normally unused for TCP)
+            MsgType.DISCONNECT   : self._on_server_disconnect,
         }
         handler = built_in_handlers.get(frame.msg_type)
         if handler:
@@ -433,9 +434,17 @@ class NIDSClient:
         self._incoming_total_chunks  = frame.extra.get("total_chunks", 0)
         self._incoming_received_chunks = 0
         self._incoming_buffer        = bytearray()
+        sender = frame.extra.get("from", frame.sender)
+        file_size = frame.extra.get("file_size", 0)
         log.info(
-            "[FILE] Incoming '%s' (%d chunks)",
-            self._incoming_file_name, self._incoming_total_chunks,
+            "[FILE] Incoming '%s' (%d chunks) from %s",
+            self._incoming_file_name, self._incoming_total_chunks, sender,
+        )
+        from communication.utils import format_size
+        print(
+            f"\n  [FILE INCOMING] '{self._incoming_file_name}' "
+            f"({format_size(file_size)}, {self._incoming_total_chunks} chunks) "
+            f"from {sender} -- receiving..."
         )
 
     def _on_file_chunk(self, frame: Frame) -> None:
@@ -452,17 +461,29 @@ class NIDSClient:
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / self._incoming_file_name
         dest.write_bytes(bytes(self._incoming_buffer))
+        saved_size = len(self._incoming_buffer)
         log.info(
-            "[FILE] Saved '%s' (%s)",
+            "[FILE] Saved '%s' (%s) -> %s",
             self._incoming_file_name,
-            format_size(len(self._incoming_buffer)),
+            format_size(saved_size),
+            dest,
         )
         print(
-            f"\n  [FILE] Received: {self._incoming_file_name} "
-            f"({format_size(len(self._incoming_buffer))})"
+            f"\n  [FILE SAVED] '{self._incoming_file_name}' "
+            f"({format_size(saved_size)})\n"
+            f"  Path: {dest}"
         )
         self._incoming_file_name = None
         self._incoming_buffer    = bytearray()
+
+    def _on_file_incoming(self, frame: Frame) -> None:
+        """Fallback: normally TCP clients receive files via FILE_META/CHUNK/DONE.
+        This handler fires only if routing changes in the future."""
+        file_name = frame.extra.get("file_name", "file")
+        file_size = frame.extra.get("file_size", 0)
+        sender    = frame.extra.get("from", frame.sender)
+        log.info("[FILE] FILE_INCOMING '%s' (%s) from %s", file_name, format_size(file_size), sender)
+        print(f"\n  [FILE] '{file_name}' ({format_size(file_size)}) from {sender} -- see received_files/")
 
     def _on_server_disconnect(self, frame: Frame) -> None:
         log.info("Server sent DISCONNECT: %s", frame.text)

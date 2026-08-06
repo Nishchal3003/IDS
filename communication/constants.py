@@ -36,7 +36,7 @@ USE_TLS: bool     = True             # enable TLS on the TCP socket layer
 # ---------------------------------------------------------------------------
 # Timeouts  (seconds)
 # ---------------------------------------------------------------------------
-SOCKET_TIMEOUT: float     = 60.0     # idle connection timeout
+SOCKET_TIMEOUT: float     = 300.0    # idle connection timeout (5 min - allows large file relay)
 RECONNECT_DELAY: float    = 3.0      # seconds between reconnect attempts
 MAX_RECONNECT_TRIES: int  = 5        # max automatic reconnect attempts
 HEARTBEAT_INTERVAL: float = 10.0     # seconds between keep-alive pings
@@ -46,6 +46,7 @@ HEARTBEAT_INTERVAL: float = 10.0     # seconds between keep-alive pings
 # ---------------------------------------------------------------------------
 FILE_CHUNK_SIZE: int    = 65536      # 64 KB per file chunk
 MAX_FILE_SIZE: int      = 104857600  # 100 MB hard limit
+FILE_TRANSFER_TIMEOUT: int = 300     # seconds to wait for file transfer to complete
 
 # ---------------------------------------------------------------------------
 # Wire-protocol delimiters

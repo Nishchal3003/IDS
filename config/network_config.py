@@ -24,7 +24,11 @@ USE_TLS: bool = True         # Enable TLS on TCP sockets (requires certs/)
 NETWORK_PSK: str   = "nids-secure-2026"   # Pre-shared key for HMAC auth
 HMAC_ALGORITHM: str = "sha256"             # Algorithm used for auth + integrity
 
-
+# ── Network Access Control ────────────────────────────────────────────────────
+# When True, only devices on the same /24 LAN subnet as the server may connect.
+# Loopback (127.x.x.x / ::1) is always allowed for same-machine testing.
+# Set to False only for testing across different subnets (e.g., VPN tunnels).
+LAN_ONLY_MODE: bool = True
 
 # ── Protocol ──────────────────────────────────────────────────────────────────
 BUFFER_SIZE: int = 4096    # Socket recv buffer in bytes
@@ -37,7 +41,7 @@ MAX_RECONNECT_TRIES: int  = 5       # Maximum automatic reconnect attempts
 HEARTBEAT_INTERVAL: float = 10.0    # Seconds between server PING messages
 
 # ── Capacity ──────────────────────────────────────────────────────────────────
-MAX_CLIENTS: int = 10      # Maximum simultaneous client connections
+MAX_CLIENTS: int = 5       # Maximum simultaneous connections (TCP + browser combined)
 
 # ── File transfer ─────────────────────────────────────────────────────────────
 FILE_CHUNK_SIZE: int = 65536        # 64 KB per chunk

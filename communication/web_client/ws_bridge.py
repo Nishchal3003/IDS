@@ -77,6 +77,7 @@ from typing import Optional, TYPE_CHECKING
 
 from communication.constants import (
     ENCODING,
+    MAX_CLIENTS,
     MAX_FILE_SIZE,
     MsgType,
     TRUST_INITIAL,
@@ -89,7 +90,7 @@ from communication.security import (
     server_ssl_context,
     certs_exist,
 )
-from communication.utils import format_size, timestamp_to_str
+from communication.utils import format_size, get_local_ip, is_lan_peer, timestamp_to_str
 
 if TYPE_CHECKING:
     from communication.server_core import NIDSServer
@@ -276,10 +277,28 @@ class BrowserSession:
                 await self._ws.send(json.dumps({
                     "type"   : "ERROR",
                     "message": "Authentication failed. Wrong network password.",
+                    "pre_login": True,
                 }))
                 self._alive = False
                 return
 
+        # ── Capacity check ───────────────────────────────────────────
+        current = len(self._server.sessions)
+        if current >= MAX_CLIENTS:
+            log.warning(
+                "[WS] Rejecting browser '%s' from %s — server full (%d/%d)",
+                alias, self.address[0], current, MAX_CLIENTS,
+            )
+            await self._ws.send(json.dumps({
+                "type"     : "SERVER_FULL",
+                "message"  : f"Server is full ({current}/{MAX_CLIENTS} clients). Try again later.",
+                "pre_login": True,
+            }))
+            self._alive = False
+            return
+
+        # ── All checks passed: register session ─────────────────────────
+        self._server.register_browser_session(self)
         log.info("Browser HELLO from %s (%s)", self.alias, self.address[0])
 
         peers = [s.alias for s in self._server.sessions.values() if s is not self]
@@ -431,7 +450,10 @@ class BrowserSession:
     # ------------------------------------------------------------------
     async def run(self) -> None:
         """Async receive loop. Runs until the WebSocket closes."""
-        self._server.register_browser_session(self)
+        # NOTE: register_browser_session() is called inside _handle_hello()
+        # AFTER all checks pass (LAN, capacity, auth).  We do NOT pre-register
+        # here so that rejected browsers never appear in self._server.sessions.
+        _registered = False
         try:
             async for raw_msg in self._ws:
                 if not self._alive:
@@ -446,6 +468,8 @@ class BrowserSession:
 
                 if msg_type == "HELLO":
                     await self._handle_hello(data)
+                    # Track whether we successfully registered
+                    _registered = self._alive and (self._browser_key != 0)
                 elif msg_type == "CHAT":
                     await self._handle_chat(data)
                 elif msg_type == "FILE":
@@ -464,7 +488,8 @@ class BrowserSession:
             log.warning("BrowserSession %s error: %s", self.alias, exc)
         finally:
             self._alive = False
-            self._server.unregister_browser_session(self)
+            if _registered:
+                self._server.unregister_browser_session(self)
             log.info("Browser session closed: %s", self.alias)
 
 
@@ -509,6 +534,30 @@ def start_ws_server(server: "NIDSServer", host: str, port: int) -> None:
         )
 
     async def _handler(websocket):
+        """
+        Entry point for every new WebSocket connection.
+        Performs LAN-only check before creating the session.
+        """
+        client_ip = websocket.remote_address[0]
+
+        # ── LAN-only guard ─────────────────────────────────────────────
+        if server._lan_only:
+            if not is_lan_peer(client_ip, server._local_ip):
+                log.warning(
+                    "[WS] Rejecting %s — not on local network (LAN-only mode)",
+                    client_ip,
+                )
+                try:
+                    await websocket.send(json.dumps({
+                        "type": "ERROR",
+                        "message": "Connection rejected: this server only accepts connections from the local network.",
+                        "lan_reject": True,
+                    }))
+                except Exception:
+                    pass
+                await websocket.close(1008, "LAN-only: outside network")
+                return
+
         session = BrowserSession(websocket, server, asyncio.get_event_loop())
         await session.run()
 

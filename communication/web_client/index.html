@@ -585,17 +585,30 @@
     };
 
     ws.onclose = () => {
-      if (loginOverlay.style.display !== 'none' && loginOverlay.style.display !== '') return;
+      // If we never received WELCOME, this is a pre-login rejection.
+      if (!connectedOnce) {
+        if (!loginError.textContent) {
+          showLoginError('Connection closed by server before login completed.');
+        }
+        resetConnectBtn();
+        ws = null;
+        return;
+      }
       setOnline(false);
+      connectedOnce = false;
       appendSystem('Disconnected from server.');
     };
   }
 
   /* ── Message dispatcher ───────────────────────────────────── */
+  let connectedOnce = false;   // true after WELCOME received
+
   function handleMessage(msg) {
     switch (msg.type) {
       case 'WELCOME':
+        connectedOnce = true;
         loginOverlay.style.display = 'none';
+        loginError.textContent = '';
         setOnline(true);
         peers = msg.peers || [];
         renderPeers();
@@ -630,7 +643,22 @@
         break;
 
       case 'ERROR':
-        appendError(msg.message);
+        if (!connectedOnce) {
+          // Pre-login error: show in the login form, reset button
+          showLoginError(msg.message);
+          resetConnectBtn();
+          ws = null;
+        } else {
+          appendError(msg.message);
+        }
+        break;
+
+      case 'SERVER_FULL':
+        // Always a pre-login rejection — show in login form
+        showLoginError(msg.message || 'Server is full. Try again later.');
+        resetConnectBtn();
+        try { if (ws) ws.close(); } catch(e) {}
+        ws = null;
         break;
 
       case 'FILE_INCOMING':

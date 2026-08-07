@@ -29,7 +29,7 @@ WEB_PORT: int     = 8080             # HTTP port — serves the browser client U
 WS_PORT: int      = 8081             # WebSocket port — browser real-time comms
 BUFFER_SIZE: int  = 4096             # socket recv buffer  (bytes)
 ENCODING: str     = "utf-8"          # text encoding for all messages
-MAX_CLIENTS: int  = 10               # max simultaneous clients
+MAX_CLIENTS: int  = 5                # max simultaneous clients (TCP + browser combined)
 USE_TLS: bool     = True             # enable TLS on the TCP socket layer
 
 

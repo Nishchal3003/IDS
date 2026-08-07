@@ -10,6 +10,7 @@ circular dependencies.
 Contents
 --------
 •  get_local_ip()       – discover the machine's LAN IP address
+•  is_lan_peer()        – check if a remote IP is on the local /24 subnet
 •  format_size()        – human-readable byte sizes  (e.g. "1.23 MB")
 •  format_duration()    – human-readable elapsed time
 •  sanitise_alias()     – validate and clean a user-chosen device alias
@@ -18,6 +19,7 @@ Contents
 •  get_file_chunks()    – generator that yields FILE_CHUNK_SIZE slices
 """
 
+import ipaddress
 import os
 import socket
 import time
@@ -58,6 +60,49 @@ def get_local_ip() -> str:
     except OSError:
         log.warning("Could not determine LAN IP; falling back to 127.0.0.1")
         return "127.0.0.1"
+
+
+def is_lan_peer(client_ip: str, server_ip: Optional[str] = None) -> bool:
+    """
+    Return ``True`` if *client_ip* is allowed to connect to this server.
+
+    Rules (in priority order):
+    1. Loopback addresses (127.x.x.x, ::1) are always allowed
+       so that same-machine testing works.
+    2. If *server_ip* is provided, allow only IPs in the same /24 subnet
+       (e.g. server=192.168.0.102 → allow 192.168.0.0/24).
+    3. If *server_ip* is not provided, allow any RFC-1918 private address.
+
+    Parameters
+    ----------
+    client_ip  : str
+        The IP address of the connecting peer (IPv4 or IPv6 string).
+    server_ip  : str | None
+        The server's own LAN IP.  Pass ``None`` to allow any private IP.
+
+    Returns
+    -------
+    bool
+        ``True`` → connection allowed, ``False`` → reject.
+    """
+    # Strip IPv6-mapped IPv4 prefix (e.g. "::ffff:192.168.0.1" -> "192.168.0.1")
+    if client_ip.startswith("::ffff:"):
+        client_ip = client_ip[7:]
+    try:
+        client = ipaddress.ip_address(client_ip)
+        # Rule 1: loopback always allowed
+        if client.is_loopback:
+            return True
+        # Rule 2: same /24 as server
+        if server_ip and server_ip != "127.0.0.1":
+            srv = ipaddress.ip_address(server_ip)
+            net = ipaddress.ip_network(f"{srv}/24", strict=False)
+            return client in net
+        # Rule 3: any private address
+        return client.is_private
+    except ValueError:
+        log.warning("is_lan_peer: could not parse IP '%s'", client_ip)
+        return False
 
 
 def is_valid_ip(ip: str) -> bool:

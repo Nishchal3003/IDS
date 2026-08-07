@@ -57,6 +57,8 @@ from communication.tls import certs_exist, server_ssl_context
 from communication.utils import (
     format_size,
     get_file_chunks,
+    get_local_ip,
+    is_lan_peer,
     safe_send,
     timestamp_to_str,
     validate_file_for_transfer,
@@ -439,6 +441,16 @@ class NIDSServer:
         self._server_sock: Optional[socket.socket] = None
         self._running: bool = False
 
+        # Detect server's own LAN IP for LAN-only enforcement
+        self._local_ip: str = get_local_ip()
+
+        # Load LAN-only mode from config
+        try:
+            from config.network_config import LAN_ONLY_MODE
+            self._lan_only: bool = LAN_ONLY_MODE
+        except ImportError:
+            self._lan_only: bool = True   # safe default
+
         # TLS context — created once if certs are available
         self._ssl_ctx = None
         if USE_TLS:
@@ -480,19 +492,24 @@ class NIDSServer:
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((self._host, self._port))
-        self._server_sock.listen(MAX_CLIENTS)
+        # Use a generous backlog (128) so pending handshakes don’t drop;
+        # MAX_CLIENTS limits *accepted/active* sessions, not the queue.
+        self._server_sock.listen(128)
         self._server_sock.settimeout(1.0)
         self._running = True
 
         log.info(
-            "NIDS Server listening on %s:%s (max %d clients) | TLS: %s",
+            "NIDS Server listening on %s:%s (max %d clients) | TLS: %s | LAN-only: %s",
             self._host, self._port, MAX_CLIENTS,
             "ON" if self._ssl_ctx else "OFF",
+            "ON" if self._lan_only else "OFF",
         )
         print(f"\n{'='*60}")
         print(f"  NIDS Private Network Server")
         print(f"  TCP  (Python clients) : {self._host}:{self._port}  |  TLS: {'ON' if self._ssl_ctx else 'OFF'}")
-        print(f"  Max clients           : {MAX_CLIENTS}")
+        print(f"  Server IP (LAN)       : {self._local_ip}")
+        print(f"  Max clients           : {MAX_CLIENTS} (TCP + browser combined)")
+        print(f"  LAN-only mode         : {'ENABLED  -- outside IPs rejected' if self._lan_only else 'DISABLED'}")
         print(f"  Press Ctrl+C to stop")
         print(f"{'='*60}\n")
 
@@ -525,7 +542,28 @@ class NIDSServer:
             except socket.timeout:
                 continue   # socket was closed by stop()
 
+            client_ip = addr[0]
+
+            # ── LAN-only guard ─────────────────────────────────────────────
+            if self._lan_only and not is_lan_peer(client_ip, self._local_ip):
+                log.warning(
+                    "Rejecting %s:%s — not on local network (LAN-only mode)",
+                    *addr,
+                )
+                try:
+                    reject_msg = build_text_frame(
+                        MsgType.ERROR, "server",
+                        "Connection rejected: this server only accepts LAN connections.",
+                    )
+                    conn.sendall(reject_msg)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+                continue
+
             with self._sessions_lock:
+                # ── Capacity guard ─────────────────────────────────────────
                 if len(self._sessions) >= MAX_CLIENTS:
                     log.warning(
                         "Rejecting %s:%s – server full (%d/%d)",
@@ -534,7 +572,7 @@ class NIDSServer:
                     try:
                         full_msg = build_text_frame(
                             MsgType.SERVER_FULL, "server",
-                            "Server is full. Try again later."
+                            f"Server is full ({len(self._sessions)}/{MAX_CLIENTS} clients). Try again later."
                         )
                         conn.sendall(full_msg)
                     finally:

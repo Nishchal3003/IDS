@@ -1,458 +1,219 @@
-"""
-ws_bridge.py
-------------
-WebSocket bridge that connects browser clients to the NIDSServer session
-registry, enabling real-time bidirectional communication without any
-client-side installation.
-
-Security (Phase 1 Enhancement)
--------------------------------
-The WebSocket server now uses WSS (WebSocket Secure = WS over TLS) using
-the same certificate as the TCP server (certs/server.crt + server.crt.key).
-
-Browsers connect to ``wss://server-ip:8444`` instead of ``ws://``.
-All traffic is AES-256 encrypted — identical protection to the TCP channel.
-
-Authentication: browser clients must include a HMAC-SHA256 auth token in
-their HELLO message (computed from the network PSK + alias).  The server
-rejects the connection if the token is wrong or missing.
-
-Architecture
-------------
-::
-
-    Browser (any device)
-        |
-        | WebSocket (ws://server-ip:8081)
-        |
-    BrowserSession  ←──────────────────────── NIDSServer._sessions
-        |                                          |
-        | bridge: JSON ↔ NIDS Frame               | broadcast() / remove_session()
-        |                                          |
-    WebSocket handler (asyncio)        ClientSession threads (threading)
-
-BrowserSession
-~~~~~~~~~~~~~~
-Mimics the ``ClientSession`` interface so ``NIDSServer.broadcast()`` can
-send frames to browser clients exactly as it does to TCP clients.
-
-When ``broadcast()`` calls ``session.send(raw_bytes)``, BrowserSession:
-  1. Decodes the NIDS binary frame with ``decode_frame_bytes()``.
-  2. Converts the Frame to a JSON dict.
-  3. Schedules ``websocket.send(json)`` on the asyncio event loop.
-
-Browser → Server JSON protocol
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-::
-
-    {"type": "HELLO",      "alias": "MyPhone"}
-    {"type": "CHAT",       "text": "Hello!"}
-    {"type": "FILE",       "filename": "notes.pdf", "data": "<base64>", "size": 12345}
-    {"type": "LIST_PEERS"}
-    {"type": "DISCONNECT"}
-
-Server → Browser JSON protocol
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-::
-
-    {"type": "WELCOME",      "message": "...", "peers": [...]}
-    {"type": "BROADCAST",    "from": "Alice",  "text": "...", "time": "10:30:00"}
-    {"type": "PEER_JOIN",    "alias": "Bob",   "message": "Bob joined"}
-    {"type": "PEER_LEAVE",   "alias": "Bob",   "message": "Bob left"}
-    {"type": "ACK",          "message": "File received"}
-    {"type": "PEER_LIST",    "peers": [...]}
-    {"type": "ERROR",        "message": "..."}
-    {"type": "DISCONNECT",   "message": "reason"}
-    {"type": "FILE_INCOMING","from": "Alice", "filename": "doc.pdf",
-                             "data": "<base64>", "size": 12345}
-"""
+"""WebSocket bridge connecting browser clients to NIDSServer."""
 
 import asyncio
 import base64
 import json
+import math
 import threading
 import time
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 from communication.constants import (
-    ENCODING,
-    MAX_CLIENTS,
-    MAX_FILE_SIZE,
-    MsgType,
-    TRUST_INITIAL,
-    WS_PORT,
+    ENCODING, FILE_CHUNK_SIZE, MAX_CLIENTS, MAX_FILE_SIZE, MsgType, TRUST_INITIAL,
 )
 from communication.logger import get_logger
-from communication.protocol import decode_frame_bytes, build_text_frame
-from communication.security import (
-    verify_auth_token,
-    server_ssl_context,
-    certs_exist,
+from communication.protocol import (
+    build_file_chunk_frame, build_frame, build_text_frame, decode_frame_bytes,
 )
-from communication.utils import format_size, get_local_ip, is_lan_peer, timestamp_to_str
+from communication.security import certs_exist, server_ssl_context, verify_auth_token
+from communication.utils import format_size, is_lan_peer, timestamp_to_str
 
 if TYPE_CHECKING:
     from communication.server_core import NIDSServer
 
 log = get_logger("ws_bridge")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+RECEIVED_DIR = PROJECT_ROOT / "received_files" / "browser"
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
-RECEIVED_DIR: Path = PROJECT_ROOT / "received_files" / "browser"
 
-
-# ---------------------------------------------------------------------------
-# Helper: Frame → JSON dict for the browser
-# ---------------------------------------------------------------------------
-def _frame_to_browser_json(frame) -> Optional[dict]:
-    """Convert a decoded NIDS Frame to a JSON-serialisable dict."""
-    if frame.msg_type == MsgType.BROADCAST:
-        return {
-            "type" : "BROADCAST",
-            "from" : frame.extra.get("from", frame.sender),
-            "text" : frame.text,
-            "time" : frame.extra.get("time", timestamp_to_str(frame.timestamp)),
-        }
-    if frame.msg_type == MsgType.WELCOME:
-        return {
-            "type"    : "WELCOME",
-            "message" : frame.text,
-            "peers"   : frame.extra.get("peers", []),
-        }
-    if frame.msg_type == MsgType.PEER_JOIN:
-        return {
-            "type"    : "PEER_JOIN",
-            "alias"   : frame.extra.get("alias", frame.sender),
-            "message" : frame.text,
-        }
-    if frame.msg_type == MsgType.PEER_LEAVE:
-        return {
-            "type"    : "PEER_LEAVE",
-            "alias"   : frame.extra.get("alias", frame.sender),
-            "message" : frame.text,
-        }
-    if frame.msg_type == MsgType.ACK:
-        return {"type": "ACK", "message": frame.text}
-    if frame.msg_type == MsgType.ERROR:
-        return {"type": "ERROR", "message": frame.text}
-    if frame.msg_type == MsgType.SERVER_FULL:
-        return {"type": "ERROR", "message": frame.text}
-    if frame.msg_type == MsgType.DISCONNECT:
-        return {"type": "DISCONNECT", "message": frame.text}
-    if frame.msg_type == MsgType.PING:
-        return {"type": "PING"}
-    if frame.msg_type == MsgType.PEER_LIST:
-        return {"type": "PEER_LIST", "peers": frame.extra.get("peers", [])}
-    if frame.msg_type == MsgType.FILE_INCOMING:
-        # Relay a file shared by a TCP or browser peer.
-        # The payload is the raw base64-encoded file bytes.
-        return {
-            "type"    : "FILE_INCOMING",
-            "from"    : frame.extra.get("from", frame.sender),
-            "filename": frame.extra.get("file_name", "file"),
-            "size"    : frame.extra.get("file_size", 0),
-            "data"    : frame.payload.decode("ascii"),  # already base64
-        }
-    # All other frame types are silently dropped (not relevant to browser)
+def _frame_to_json(frame) -> Optional[dict]:
+    """Convert a NIDS Frame to a JSON-serialisable dict for the browser."""
+    mt = frame.msg_type
+    if mt == MsgType.BROADCAST:
+        return {"type": "BROADCAST", "from": frame.extra.get("from", frame.sender),
+                "text": frame.text, "time": frame.extra.get("time", timestamp_to_str(frame.timestamp))}
+    if mt == MsgType.WELCOME:
+        return {"type": "WELCOME", "message": frame.text, "peers": frame.extra.get("peers", [])}
+    if mt == MsgType.PEER_JOIN:
+        return {"type": "PEER_JOIN",  "alias": frame.extra.get("alias", frame.sender), "message": frame.text}
+    if mt == MsgType.PEER_LEAVE:
+        return {"type": "PEER_LEAVE", "alias": frame.extra.get("alias", frame.sender), "message": frame.text}
+    if mt == MsgType.ACK:         return {"type": "ACK",        "message": frame.text}
+    if mt == MsgType.ERROR:       return {"type": "ERROR",       "message": frame.text}
+    if mt == MsgType.SERVER_FULL: return {"type": "SERVER_FULL", "message": frame.text}
+    if mt == MsgType.DISCONNECT:  return {"type": "DISCONNECT",  "message": frame.text}
+    if mt == MsgType.PING:        return {"type": "PING"}
+    if mt == MsgType.PEER_LIST:   return {"type": "PEER_LIST",   "peers": frame.extra.get("peers", [])}
+    if mt == MsgType.FILE_INCOMING:
+        return {"type": "FILE_INCOMING", "from": frame.extra.get("from", frame.sender),
+                "filename": frame.extra.get("file_name", "file"),
+                "size": frame.extra.get("file_size", 0),
+                "data": frame.payload.decode("ascii")}
     return None
 
 
-# ---------------------------------------------------------------------------
-# BrowserSession
-# ---------------------------------------------------------------------------
 class BrowserSession:
-    """
-    Represents one browser client connected via WebSocket.
-
-    This class mirrors the ``ClientSession`` interface so it can be
-    registered in ``NIDSServer._sessions`` and participate in broadcasts.
-
-    Parameters
-    ----------
-    websocket :
-        The ``websockets`` WebSocket connection object.
-    server : NIDSServer
-        Reference to the shared server instance.
-    loop : asyncio.AbstractEventLoop
-        The asyncio event loop running in the WebSocket thread.
-    """
+    """One browser client connected via WebSocket. Mirrors ClientSession interface."""
 
     def __init__(self, websocket, server: "NIDSServer", loop: asyncio.AbstractEventLoop) -> None:
-        self._ws        = websocket
-        self._server    = server
-        self._loop      = loop
-        self._browser_key: int = 0   # set by register_browser_session()
-        self._is_browser: bool = True  # used by server_core to distinguish from TCP
+        self._ws, self._server, self._loop = websocket, server, loop
+        self._browser_key: int = 0
+        self._is_browser: bool = True
+        self.alias        = f"browser@{websocket.remote_address[0]}"
+        self.address      = websocket.remote_address
+        self.trust_score  = TRUST_INITIAL
+        self.connected_at = time.time()
+        self._alive       = True
 
-        # Mirrors ClientSession public attributes
-        self.alias: str          = f"browser@{websocket.remote_address[0]}"
-        self.address: tuple      = websocket.remote_address
-        self.trust_score: int    = TRUST_INITIAL
-        self.connected_at: float = time.time()
-        self._alive: bool        = True
-
-    # ------------------------------------------------------------------
-    # ClientSession-compatible interface
-    # ------------------------------------------------------------------
     def send(self, data: bytes) -> bool:
-        """
-        Receive a NIDS binary frame, decode it, convert to JSON, and
-        forward to the browser over WebSocket.
-        """
         if not self._alive:
             return False
         frame = decode_frame_bytes(data)
         if frame is None:
             return False
-        payload = _frame_to_browser_json(frame)
+        payload = _frame_to_json(frame)
         if payload is None:
-            return True   # silently ignore irrelevant frame types
-        json_str = json.dumps(payload)
+            return True  # silently ignore irrelevant frames
+        js = json.dumps(payload)
         try:
-            # Detect whether we are being called from WITHIN the asyncio
-            # event loop (e.g. from _handle_chat → server.broadcast()) or
-            # from an external thread (TCP session thread, heartbeat thread).
-            #
-            # If we're on the same loop and call .result() we would deadlock
-            # because .result() blocks the very loop it's waiting on.
             try:
-                running_loop = asyncio.get_running_loop()
+                running = asyncio.get_running_loop()
             except RuntimeError:
-                running_loop = None
-
-            if running_loop is self._loop:
-                # Same event loop — schedule as a fire-and-forget task.
-                self._loop.create_task(self._ws.send(json_str))
+                running = None
+            if running is self._loop:
+                self._loop.create_task(self._ws.send(js))
             else:
-                # External thread — safe to block.
-                asyncio.run_coroutine_threadsafe(
-                    self._ws.send(json_str), self._loop
-                ).result(timeout=5)
+                asyncio.run_coroutine_threadsafe(self._ws.send(js), self._loop).result(timeout=5)
             return True
-        except Exception as exc:
-            log.warning("BrowserSession.send failed for %s: %s", self.alias, exc)
+        except Exception as e:
+            log.warning("BrowserSession.send failed for %s: %s", self.alias, e)
             self._alive = False
             return False
 
     def disconnect(self, reason: str = "server request") -> None:
-        """Close the WebSocket connection."""
         if not self._alive:
             return
         self._alive = False
-        msg = json.dumps({"type": "DISCONNECT", "message": reason})
         try:
             asyncio.run_coroutine_threadsafe(
-                self._ws.send(msg), self._loop
-            ).result(timeout=2)
+                self._ws.send(json.dumps({"type": "DISCONNECT", "message": reason})),
+                self._loop).result(timeout=2)
         except Exception:
             pass
         asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
 
-    # ------------------------------------------------------------------
-    # Incoming message handlers (called from asyncio context)
-    # ------------------------------------------------------------------
     async def _handle_hello(self, data: dict) -> None:
-        alias = data.get("alias", "browser-user").strip()
-        # Sanitise: keep only safe chars
-        alias = "".join(c for c in alias if c.isalnum() or c in "-_")[:20] or "browser-user"
-        # Ensure uniqueness
+        alias = "".join(c for c in data.get("alias", "browser-user").strip()
+                        if c.isalnum() or c in "-_")[:20] or "browser-user"
         existing = [s.alias for s in self._server.sessions.values()]
         if alias in existing:
             alias = f"{alias}-{self.address[1]}"
         self.alias = alias
 
-        # ── PSK authentication ────────────────────────────────────────
         try:
             from config.network_config import NETWORK_PSK
         except ImportError:
             NETWORK_PSK = ""
-
-        if NETWORK_PSK:
-            auth_token = data.get("auth_token", "")
-            if not verify_auth_token(NETWORK_PSK, alias, auth_token):
-                log.warning(
-                    "Browser auth FAILED for alias '%s' from %s",
-                    alias, self.address[0],
-                )
-                await self._ws.send(json.dumps({
-                    "type"   : "ERROR",
-                    "message": "Authentication failed. Wrong network password.",
-                    "pre_login": True,
-                }))
-                self._alive = False
-                return
-
-        # ── Capacity check ───────────────────────────────────────────
-        current = len(self._server.sessions)
-        if current >= MAX_CLIENTS:
-            log.warning(
-                "[WS] Rejecting browser '%s' from %s — server full (%d/%d)",
-                alias, self.address[0], current, MAX_CLIENTS,
-            )
-            await self._ws.send(json.dumps({
-                "type"     : "SERVER_FULL",
-                "message"  : f"Server is full ({current}/{MAX_CLIENTS} clients). Try again later.",
-                "pre_login": True,
-            }))
+        if NETWORK_PSK and not verify_auth_token(NETWORK_PSK, alias, data.get("auth_token", "")):
+            log.warning("Browser auth FAILED for '%s' from %s", alias, self.address[0])
+            await self._ws.send(json.dumps({"type": "ERROR",
+                                            "message": "Authentication failed. Wrong network password.",
+                                            "pre_login": True}))
             self._alive = False
             return
 
-        # ── All checks passed: register session ─────────────────────────
+        n = len(self._server.sessions)
+        if n >= MAX_CLIENTS:
+            log.warning("[WS] Server full (%d/%d), rejecting %s", n, MAX_CLIENTS, alias)
+            await self._ws.send(json.dumps({"type": "SERVER_FULL",
+                                            "message": f"Server full ({n}/{MAX_CLIENTS}). Try later.",
+                                            "pre_login": True}))
+            self._alive = False
+            return
+
         self._server.register_browser_session(self)
         log.info("Browser HELLO from %s (%s)", self.alias, self.address[0])
-
         peers = [s.alias for s in self._server.sessions.values() if s is not self]
-        welcome = json.dumps({
-            "type"    : "WELCOME",
-            "message" : f"Welcome to NIDS-Net, {self.alias}!",
-            "peers"   : peers,
-        })
-        await self._ws.send(welcome)
-
-        # Notify existing clients
-        join_frame = build_text_frame(
-            MsgType.PEER_JOIN, "server",
-            f"{self.alias} joined the network",
-            extra={"alias": self.alias, "ip": self.address[0]},
-        )
-        self._server.broadcast(join_frame, exclude=self)
+        await self._ws.send(json.dumps({"type": "WELCOME",
+                                        "message": f"Welcome to NIDS-Net, {self.alias}!",
+                                        "peers": peers}))
+        self._server.broadcast(
+            build_text_frame(MsgType.PEER_JOIN, "server", f"{self.alias} joined",
+                             extra={"alias": self.alias, "ip": self.address[0]}),
+            exclude=self)
 
     async def _handle_chat(self, data: dict) -> None:
         text = data.get("text", "").strip()
         if not text:
             return
-        log.info("[CHAT] %s (browser) -> broadcast: %s", self.alias, text)
         ts = timestamp_to_str(time.time())
-        relay = build_text_frame(
-            MsgType.BROADCAST, self.alias, text,
-            extra={
-                "from" : self.alias,
-                "time" : ts,
-            },
-        )
-        # Broadcast to everyone EXCEPT self (avoids the event-loop deadlock
-        # where send() is called from within the same asyncio loop).
-        self._server.broadcast(relay, exclude=self)
-        # Echo the message back to self directly with await (safe, no deadlock).
-        echo = {"type": "BROADCAST", "from": self.alias, "text": text, "time": ts}
-        await self._ws.send(json.dumps(echo))
+        self._server.broadcast(
+            build_text_frame(MsgType.BROADCAST, self.alias, text,
+                             extra={"from": self.alias, "time": ts}), exclude=self)
+        await self._ws.send(json.dumps({"type": "BROADCAST", "from": self.alias, "text": text, "time": ts}))
 
     async def _handle_file(self, data: dict) -> None:
         filename = data.get("filename", "upload")
         b64data  = data.get("data", "")
         try:
             raw = base64.b64decode(b64data)
-        except Exception as exc:
-            await self._ws.send(json.dumps({"type": "ERROR", "message": f"Bad file data: {exc}"}))
-            return
-
+        except Exception as e:
+            await self._ws.send(json.dumps({"type": "ERROR", "message": f"Bad file data: {e}"})); return
         if len(raw) > MAX_FILE_SIZE:
-            await self._ws.send(json.dumps({
-                "type": "ERROR",
-                "message": f"File too large ({format_size(len(raw))}). Limit: {format_size(MAX_FILE_SIZE)}",
-            }))
+            await self._ws.send(json.dumps({"type": "ERROR",
+                                            "message": f"File too large ({format_size(len(raw))}). Limit: {format_size(MAX_FILE_SIZE)}"}))
             return
 
         RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
-        dest = RECEIVED_DIR / filename
-        dest.write_bytes(raw)
-        file_size = len(raw)
-        log.info("[FILE] Browser %s sent '%s' (%s) — relaying to peers", self.alias, filename, format_size(file_size))
+        (RECEIVED_DIR / filename).write_bytes(raw)
+        size         = len(raw)
+        total_chunks = math.ceil(size / FILE_CHUNK_SIZE) or 1
+        log.info("[FILE] Browser %s → '%s' (%s)", self.alias, filename, format_size(size))
+        await self._ws.send(json.dumps({"type": "ACK",
+                                        "message": f"'{filename}' received ({format_size(size)}) — relaying"}))
 
-        # ACK back to sender immediately (before relay)
-        await self._ws.send(json.dumps({
-            "type"   : "ACK",
-            "message": f"File '{filename}' received ({format_size(file_size)}) — relaying to peers",
-        }))
+        others        = [s for s in self._server.sessions.values() if s is not self]
+        tcp_peers     = [s for s in others if not hasattr(s, "_is_browser")]
+        browser_peers = [s for s in others if hasattr(s, "_is_browser")]
 
-        # ── Gather relay targets ──────────────────────────────────────────
-        import math as _math
-        from communication.constants import FILE_CHUNK_SIZE
-        from communication.protocol import build_file_chunk_frame, build_frame
-
-        other_sessions = [s for s in self._server.sessions.values() if s is not self]
-        tcp_peers     = [s for s in other_sessions if not hasattr(s, "_is_browser")]
-        browser_peers = [s for s in other_sessions if hasattr(s, "_is_browser")]
-        total_chunks  = _math.ceil(file_size / FILE_CHUNK_SIZE) or 1
-
-        # ── Build all TCP frames first (CPU-bound, but fast) ─────────────
-        tcp_frames = []
         if tcp_peers:
-            tcp_frames.append(build_text_frame(
-                MsgType.FILE_META, self.alias, filename,
-                extra={"file_name": filename, "file_size": file_size,
-                       "total_chunks": total_chunks, "from": self.alias},
-            ))
-            for idx in range(total_chunks):
-                start = idx * FILE_CHUNK_SIZE
-                tcp_frames.append(build_file_chunk_frame(
-                    self.alias,
-                    raw[start: start + FILE_CHUNK_SIZE],
-                    file_name=filename,
-                    chunk_index=idx,
-                    total_chunks=total_chunks,
-                ))
-            tcp_frames.append(build_text_frame(MsgType.FILE_DONE, self.alias, filename))
+            frames = [build_text_frame(MsgType.FILE_META, self.alias, filename,
+                                       extra={"file_name": filename, "file_size": size,
+                                              "total_chunks": total_chunks, "from": self.alias})]
+            for i in range(total_chunks):
+                frames.append(build_file_chunk_frame(self.alias, raw[i*FILE_CHUNK_SIZE:(i+1)*FILE_CHUNK_SIZE],
+                                                     filename, i, total_chunks))
+            frames.append(build_text_frame(MsgType.FILE_DONE, self.alias, filename))
 
-        # ── TCP relay: run in executor so we don’t block the event loop ──
-        def _relay_tcp():
-            for frame_bytes in tcp_frames:
-                for peer in list(tcp_peers):   # copy to avoid mutation
-                    try:
-                        peer.send(frame_bytes)
-                    except Exception as exc:
-                        log.warning("[FILE] TCP relay to %s failed: %s", peer.alias, exc)
+            def _relay_tcp():
+                for f in frames:
+                    for p in list(tcp_peers):
+                        try: p.send(f)
+                        except Exception as e: log.warning("[FILE] TCP→%s: %s", p.alias, e)
 
-        if tcp_frames:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _relay_tcp)
+            await asyncio.get_event_loop().run_in_executor(None, _relay_tcp)
 
-        # ── Browser relay: single FILE_INCOMING frame ────────────────
         if browser_peers:
-            incoming = build_frame(
-                MsgType.FILE_INCOMING, self.alias,
-                b64data.encode("ascii"),   # already base64
-                extra={"file_name": filename, "file_size": file_size, "from": self.alias},
-            )
+            incoming = build_frame(MsgType.FILE_INCOMING, self.alias, b64data.encode("ascii"),
+                                   extra={"file_name": filename, "file_size": size, "from": self.alias})
             for s in browser_peers:
-                try:
-                    s.send(incoming)
-                except Exception as exc:
-                    log.warning("[FILE] Browser relay to %s failed: %s",
-                                getattr(s, 'alias', '?'), exc)
+                try: s.send(incoming)
+                except Exception as e: log.warning("[FILE] Browser→%s: %s", getattr(s,"alias","?"), e)
 
-        # ── Broadcast notification in chat ──────────────────────────
-        notice = build_text_frame(
-            MsgType.BROADCAST, "server",
-            f"{self.alias} shared '{filename}' ({format_size(file_size)}) — available to all peers",
-            extra={"from": "server", "time": timestamp_to_str(time.time())},
-        )
-        self._server.broadcast(notice, exclude=self)
-        # Echo notice back to self (the browser sender)
-        await self._ws.send(json.dumps({
-            "type": "BROADCAST", "from": "server",
-            "text": f"{self.alias} shared '{filename}' ({format_size(file_size)}) — available to all peers",
-            "time": timestamp_to_str(time.time()),
-        }))
-        log.info("[FILE] Relay of '%s' complete. TCP=%d Browser=%d",
-                 filename, len(tcp_peers), len(browser_peers))
+        ts = timestamp_to_str(time.time())
+        notice_text = f"{self.alias} shared '{filename}' ({format_size(size)}) — available to all"
+        self._server.broadcast(
+            build_text_frame(MsgType.BROADCAST, "server", notice_text,
+                             extra={"from": "server", "time": ts}), exclude=self)
+        await self._ws.send(json.dumps({"type": "BROADCAST", "from": "server", "text": notice_text, "time": ts}))
 
     async def _handle_list_peers(self) -> None:
         peers = [s.alias for s in self._server.sessions.values() if s is not self]
         await self._ws.send(json.dumps({"type": "PEER_LIST", "peers": peers}))
 
-    async def _handle_disconnect(self) -> None:
-        log.info("Browser %s requested disconnect", self.alias)
-        self._alive = False
-
-    # ------------------------------------------------------------------
-    # Main async receive loop
-    # ------------------------------------------------------------------
     async def run(self) -> None:
-        """Async receive loop. Runs until the WebSocket closes."""
-        # NOTE: register_browser_session() is called inside _handle_hello()
-        # AFTER all checks pass (LAN, capacity, auth).  We do NOT pre-register
-        # here so that rejected browsers never appear in self._server.sessions.
+        """Async receive loop. Session is only registered after successful HELLO."""
         _registered = False
         try:
             async for raw_msg in self._ws:
@@ -461,31 +222,17 @@ class BrowserSession:
                 try:
                     data = json.loads(raw_msg)
                 except json.JSONDecodeError:
-                    log.warning("Malformed JSON from browser %s", self.alias)
-                    continue
-
-                msg_type = data.get("type", "").upper()
-
-                if msg_type == "HELLO":
-                    await self._handle_hello(data)
-                    # Track whether we successfully registered
-                    _registered = self._alive and (self._browser_key != 0)
-                elif msg_type == "CHAT":
-                    await self._handle_chat(data)
-                elif msg_type == "FILE":
-                    await self._handle_file(data)
-                elif msg_type == "LIST_PEERS":
-                    await self._handle_list_peers()
-                elif msg_type == "DISCONNECT":
-                    await self._handle_disconnect()
-                    break
-                elif msg_type == "PONG":
-                    pass  # valid keep-alive reply, no action needed
-                else:
-                    log.warning("Unknown browser msg_type: %s", msg_type)
-
-        except Exception as exc:
-            log.warning("BrowserSession %s error: %s", self.alias, exc)
+                    log.warning("Malformed JSON from %s", self.alias); continue
+                t = data.get("type", "").upper()
+                if   t == "HELLO":      await self._handle_hello(data); _registered = self._alive and bool(self._browser_key)
+                elif t == "CHAT":       await self._handle_chat(data)
+                elif t == "FILE":       await self._handle_file(data)
+                elif t == "LIST_PEERS": await self._handle_list_peers()
+                elif t == "DISCONNECT": self._alive = False; break
+                elif t == "PONG":       pass
+                else: log.warning("Unknown msg_type: %s", t)
+        except Exception as e:
+            log.warning("BrowserSession %s error: %s", self.alias, e)
         finally:
             self._alive = False
             if _registered:
@@ -493,97 +240,46 @@ class BrowserSession:
             log.info("Browser session closed: %s", self.alias)
 
 
-# ---------------------------------------------------------------------------
-# WebSocket server runner
-# ---------------------------------------------------------------------------
 def start_ws_server(server: "NIDSServer", host: str, port: int) -> None:
-    """
-    Start the WebSocket server (WSS if certs available, WS otherwise)
-    in a background daemon thread.
-
-    Parameters
-    ----------
-    server : NIDSServer
-        The shared server instance (for session registration).
-    host : str
-        Interface to bind (e.g. ``"0.0.0.0"``).
-    port : int
-        WebSocket port (e.g. ``8444`` for WSS).
-    """
+    """Start the WebSocket server in a background daemon thread (WSS if certs present)."""
     try:
         import websockets
     except ImportError:
-        log.error(
-            "websockets package not installed. "
-            "Run: pip install websockets"
-        )
-        return
+        log.error("websockets not installed. Run: pip install websockets"); return
 
-    # ── Choose SSL context (WSS) or None (plain WS) ───────────────────
     ssl_ctx = None
     if certs_exist():
         try:
             ssl_ctx = server_ssl_context()
-            log.info("WebSocket server will use WSS (TLS encrypted)")
-        except Exception as exc:
-            log.warning("Cannot load TLS for WSS, falling back to plain WS: %s", exc)
+            log.info("WebSocket server will use WSS")
+        except Exception as e:
+            log.warning("WSS failed, falling back to plain WS: %s", e)
     else:
-        log.warning(
-            "TLS certs not found — WebSocket will use plain ws:// (NOT encrypted). "
-            "Run: python -m communication.generate_certs"
-        )
+        log.warning("No TLS certs — WebSocket using plain ws://. Run: python -m communication.generate_certs")
 
     async def _handler(websocket):
-        """
-        Entry point for every new WebSocket connection.
-        Performs LAN-only check before creating the session.
-        """
-        client_ip = websocket.remote_address[0]
-
-        # ── LAN-only guard ─────────────────────────────────────────────
-        if server._lan_only:
-            if not is_lan_peer(client_ip, server._local_ip):
-                log.warning(
-                    "[WS] Rejecting %s — not on local network (LAN-only mode)",
-                    client_ip,
-                )
-                try:
-                    await websocket.send(json.dumps({
-                        "type": "ERROR",
-                        "message": "Connection rejected: this server only accepts connections from the local network.",
-                        "lan_reject": True,
-                    }))
-                except Exception:
-                    pass
-                await websocket.close(1008, "LAN-only: outside network")
-                return
-
-        session = BrowserSession(websocket, server, asyncio.get_event_loop())
-        await session.run()
+        ip = websocket.remote_address[0]
+        if server._lan_only and not is_lan_peer(ip, server._local_ip):
+            log.warning("[WS] Rejecting %s — not on LAN", ip)
+            try:
+                await websocket.send(json.dumps({"type": "ERROR",
+                                                 "message": "Rejected: LAN-only server.",
+                                                 "lan_reject": True}))
+            except Exception:
+                pass
+            await websocket.close(1008, "LAN-only"); return
+        await BrowserSession(websocket, server, asyncio.get_event_loop()).run()
 
     async def _serve():
-        proto = "wss" if ssl_ctx else "ws"
-        log.info("WebSocket server starting on %s://%s:%d", proto, host, port)
-        # max_size=None removes the default 1MB message limit so that files
-        # up to MAX_FILE_SIZE (100MB as base64 ~ 133MB) can be sent by browsers.
-        async with websockets.serve(
-            _handler, host, port,
-            ssl=ssl_ctx,
-            max_size=None,
-            ping_interval=20,
-            ping_timeout=60,
-        ):
-            await asyncio.Future()  # run forever
+        async with websockets.serve(_handler, host, port, ssl=ssl_ctx,
+                                    max_size=None, ping_interval=20, ping_timeout=60):
+            await asyncio.Future()
 
-    def _thread_main():
+    def _thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(_serve())
-        except Exception as exc:
-            log.error("WebSocket server error: %s", exc)
+        try: loop.run_until_complete(_serve())
+        except Exception as e: log.error("WebSocket server error: %s", e)
 
-    thread = threading.Thread(target=_thread_main, daemon=True, name="ws-server")
-    thread.start()
-    proto = "WSS" if ssl_ctx else "WS"
-    log.info("%s server thread started (port %d)", proto, port)
+    threading.Thread(target=_thread, daemon=True, name="ws-server").start()
+    log.info("%s server started (port %d)", "WSS" if ssl_ctx else "WS", port)

@@ -1,22 +1,4 @@
-"""
-client.py
----------
-Interactive CLI client for the NIDS private communication network.
-
-Run on any machine connected to the same LAN as the server:
-
-    python -m communication.client
-    OR
-    python communication/client.py
-
-The CLI provides a simple text menu:
-    [1] Send chat message
-    [2] Send file
-    [3] List peers
-    [4] Disconnect
-
-All incoming frames are printed to the console in real time.
-"""
+"""Interactive CLI client for the NIDS private communication network."""
 
 import sys
 import time
@@ -38,186 +20,85 @@ except ImportError:
     PORT = 5000
 
 log = get_logger("client")
+G, Y, R, C, RESET, BOLD = "\033[92m", "\033[93m", "\033[91m", "\033[96m", "\033[0m", "\033[1m"
 
-# ── ANSI colour codes (work on Windows 10+ via ANSI escape support) ──────────
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-RED    = "\033[91m"
-CYAN   = "\033[96m"
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
+def cp(text: str, col: str = RESET) -> None:
+    print(f"{col}{text}{RESET}")
 
-
-def colour_print(text: str, colour: str = RESET) -> None:
-    print(f"{colour}{text}{RESET}")
-
-
-# ---------------------------------------------------------------------------
-# Frame display callback
-# ---------------------------------------------------------------------------
 def display_frame(frame: Frame) -> None:
-    """Pretty-print an incoming frame to the console."""
     ts = timestamp_to_str(frame.timestamp)
-
     if frame.msg_type == MsgType.BROADCAST:
-        sender = frame.extra.get("from", frame.sender)
-        colour_print(
-            f"\n  [{ts}] {BOLD}{sender}{RESET}{CYAN}: {frame.text}",
-            CYAN,
-        )
-
+        cp(f"\n  [{ts}] {BOLD}{frame.extra.get('from', frame.sender)}{RESET}{C}: {frame.text}", C)
     elif frame.msg_type == MsgType.WELCOME:
         peers = frame.extra.get("peers", [])
-        colour_print(f"\n  [{ts}] SERVER: {frame.text}", GREEN)
-        if peers:
-            colour_print(f"         Online peers: {', '.join(peers)}", GREEN)
-
+        cp(f"\n  [{ts}] SERVER: {frame.text}", G)
+        if peers: cp(f"         Online: {', '.join(peers)}", G)
     elif frame.msg_type in (MsgType.PEER_JOIN, MsgType.PEER_LEAVE):
-        colour_print(f"\n  [{ts}] ** {frame.text}", YELLOW)
-
+        cp(f"\n  [{ts}] ** {frame.text}", Y)
     elif frame.msg_type == MsgType.ACK:
-        colour_print(f"\n  [{ts}] [OK] {frame.text}", GREEN)
-
-    elif frame.msg_type == MsgType.ERROR:
-        colour_print(f"\n  [{ts}] [ERR] SERVER ERROR: {frame.text}", RED)
-
-    elif frame.msg_type == MsgType.SERVER_FULL:
-        colour_print(f"\n  [{ts}] [ERR] {frame.text}", RED)
-
-    elif frame.msg_type in (MsgType.PING, MsgType.PONG):
-        pass   # silent keep-alive – don't clutter the terminal
-
+        cp(f"\n  [{ts}] [OK] {frame.text}", G)
+    elif frame.msg_type in (MsgType.ERROR, MsgType.SERVER_FULL):
+        cp(f"\n  [{ts}] [ERR] {frame.text}", R)
 
 def display_disconnected(reason: str) -> None:
-    colour_print(f"\n  [!] Disconnected: {reason}", RED)
+    cp(f"\n  [!] Disconnected: {reason}", R)
 
-
-# ---------------------------------------------------------------------------
-# CLI helpers
-# ---------------------------------------------------------------------------
 def print_banner() -> None:
-    print(f"""
-{CYAN}{'='*60}
-  NIDS Private Network Client
-  Intelligent Network Intrusion Detection System
-{'='*60}{RESET}
-""")
-
+    print(f"\n{C}{'='*50}\n  NIDS Private Network Client\n{'='*50}{RESET}\n")
 
 def print_menu() -> None:
-    print(f"""
-{BOLD}  Commands:{RESET}
-    {GREEN}[1]{RESET} Send chat message
-    {GREEN}[2]{RESET} Send file
-    {GREEN}[3]{RESET} List online peers
-    {GREEN}[4]{RESET} Disconnect and exit
-    {GREEN}[q]{RESET} Disconnect and exit
-""")
+    print(f"\n{BOLD}  Commands:{RESET}  {G}[1]{RESET} Chat  {G}[2]{RESET} Send file  {G}[3]{RESET} List peers  {G}[4/q]{RESET} Quit\n")
 
-
-def get_alias() -> str:
+def main() -> None:
+    print_banner()
     while True:
         try:
-            raw = input(
-                f"  {CYAN}Enter your device alias (2-20 alphanumeric chars):{RESET} "
-            ).strip()
-            return sanitise_alias(raw)
-        except ValueError as exc:
-            colour_print(f"  Invalid alias: {exc}", RED)
-
-
-def get_server_ip() -> str:
+            alias = sanitise_alias(input(f"  {C}Alias (2-20 chars):{RESET} ").strip())
+            break
+        except ValueError as e:
+            cp(f"  {e}", R)
     local = get_local_ip()
-    raw = input(
-        f"  {CYAN}Server IP address [{local}]:{RESET} "
-    ).strip()
-    return raw if raw else local
+    raw = input(f"  {C}Server IP [{local}]:{RESET} ").strip()
+    server_ip = raw or local
+    raw_port  = input(f"  {C}Server port [{PORT}]:{RESET} ").strip()
+    server_port = int(raw_port) if raw_port.isdigit() else PORT
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main() -> None:
-    """Run the interactive client CLI."""
-    print_banner()
-
-    alias     = get_alias()
-    server_ip = get_server_ip()
-    server_port_str = input(
-        f"  {CYAN}Server port [{PORT}]:{RESET} "
-    ).strip()
-    server_port = int(server_port_str) if server_port_str.isdigit() else PORT
-
-    client = NIDSClient(
-        alias=alias,
-        server_host=server_ip,
-        server_port=server_port,
-        on_frame=display_frame,
-        on_disconnected=display_disconnected,
-    )
-
-    colour_print(f"\n  Connecting to {server_ip}:{server_port} ...", YELLOW)
+    client = NIDSClient(alias, server_ip, server_port,
+                        on_frame=display_frame, on_disconnected=display_disconnected)
+    cp(f"\n  Connecting to {server_ip}:{server_port}...", Y)
     if not client.connect():
-        colour_print("  Failed to connect. Exiting.", RED)
-        sys.exit(1)
+        cp("  Failed to connect.", R); sys.exit(1)
+    cp("  Connected!\n", G)
 
-    colour_print("  Connection established!\n", GREEN)
-
-    # ── Main interaction loop ─────────────────────────────────────────────
     while client.is_connected():
         print_menu()
         try:
             choice = input(f"  {BOLD}>{RESET} ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
+            print(); break
         if choice in ("4", "q"):
             break
-
         elif choice == "1":
-            try:
-                msg = input(f"  {CYAN}Message:{RESET} ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if msg:
-                client.send_chat(msg)
-            else:
-                colour_print("  Empty message ignored.", YELLOW)
-
+            try: msg = input(f"  {C}Message:{RESET} ").strip()
+            except (EOFError, KeyboardInterrupt): break
+            if msg: client.send_chat(msg)
+            else: cp("  Empty message ignored.", Y)
         elif choice == "2":
-            try:
-                path = input(f"  {CYAN}File path:{RESET} ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
+            try: path = input(f"  {C}File path:{RESET} ").strip()
+            except (EOFError, KeyboardInterrupt): break
             if path:
-                colour_print("  Sending file...", YELLOW)
-                ok = client.send_file(path)
-                if ok:
-                    colour_print("  [OK] File sent successfully.", GREEN)
-                else:
-                    colour_print("  [ERR] File transfer failed.", RED)
-            else:
-                colour_print("  No path given.", YELLOW)
-
+                cp("  Sending...", Y)
+                cp("  [OK] Sent." if client.send_file(path) else "  [ERR] Failed.", G if client.send_file else R)
+            else: cp("  No path given.", Y)
         elif choice == "3":
-            peers = client.peers
-            if peers:
-                colour_print(f"  Online peers ({len(peers)}):", CYAN)
-                for p in peers:
-                    colour_print(f"    • {p}", CYAN)
-            else:
-                colour_print("  No other peers online.", YELLOW)
-
+            ps = client.peers
+            cp(f"  Peers ({len(ps)}): {', '.join(ps) if ps else 'none'}", C)
         else:
-            colour_print("  Unknown command.", YELLOW)
-
-        # Small delay to let the receive thread print any queued frames
+            cp("  Unknown command.", Y)
         time.sleep(0.1)
 
     client.disconnect()
-    colour_print("\n  Goodbye!\n", GREEN)
-
+    cp("\n  Goodbye!\n", G)
 
 if __name__ == "__main__":
     main()

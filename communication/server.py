@@ -1,22 +1,4 @@
-"""
-server.py
----------
-Entry point for the NIDS private network server.
-
-Run this on the machine that will act as the hub:
-
-    python main.py server
-
-The server starts THREE services:
-  1. TCP server  (port 5000, TLS encrypted)   — for Python clients
-  2. HTTPS server (port 8443, TLS encrypted)  — serves the browser client UI
-  3. WSS server   (port 8444, TLS encrypted)  — real-time browser communication
-  4. HTTP  server (port 8080, redirect only)  — redirects http:// → https://
-
-Any device on the LAN can then open:
-    https://<this-machine-ip>:8443
-and join the network instantly — no installation required.
-"""
+"""Entry point for the NIDS server — starts TCP, HTTPS, and WSS services."""
 
 import sys
 from pathlib import Path
@@ -30,86 +12,51 @@ from communication.server_core import NIDSServer
 from communication.utils import get_local_ip, is_port_in_use
 
 try:
-    from config.network_config import (
-        HOST, PORT, WEB_PORT, WS_PORT,
-        HTTPS_PORT, WSS_PORT, NETWORK_PSK,
-    )
+    from config.network_config import HOST, PORT, WEB_PORT, WS_PORT, HTTPS_PORT, WSS_PORT, NETWORK_PSK
 except ImportError:
-    HOST       = "0.0.0.0"
-    PORT       = 5000
-    WEB_PORT   = 8080
-    WS_PORT    = 8081
-    HTTPS_PORT = 8443
-    WSS_PORT   = 8444
-    NETWORK_PSK = ""
+    HOST, PORT, WEB_PORT, WS_PORT, HTTPS_PORT, WSS_PORT, NETWORK_PSK = \
+        "0.0.0.0", 5000, 8080, 8081, 8443, 8444, ""
 
 log = get_logger("server")
 
 
 def main() -> None:
-    """Start the NIDS server with HTTP and WebSocket services."""
-    local_ip = get_local_ip()
-    log.info("Local IP detected as: %s", local_ip)
-
-    # ── Port checks ──────────────────────────────────────────────────────
-    for port, label in [
-        (PORT,       "TCP"),
-        (HTTPS_PORT, "HTTPS"),
-        (WSS_PORT,   "WSS"),
-        (WEB_PORT,   "HTTP-redirect"),
-    ]:
+    local = get_local_ip()
+    for port, label in [(PORT, "TCP"), (HTTPS_PORT, "HTTPS"), (WSS_PORT, "WSS"), (WEB_PORT, "HTTP")]:
         if is_port_in_use(port, HOST):
-            log.error(
-                "[%s] Port %d is already in use. Free it or change it in config/network_config.py",
-                label, port,
-            )
+            log.error("[%s] Port %d already in use. Change in config/network_config.py", label, port)
             sys.exit(1)
 
-    # ── Create server ────────────────────────────────────────────────────
     server = NIDSServer(host=HOST, port=PORT)
 
-    # ── Start HTTPS server (daemon thread) ───────────────────────────────────
     try:
         from communication.web_client.http_server import start_https_server
         start_https_server(HOST, https_port=HTTPS_PORT, redirect_port=WEB_PORT)
-        log.info("HTTPS server started on port %d (redirect on %d)", HTTPS_PORT, WEB_PORT)
-    except Exception as exc:
-        log.warning("Could not start HTTPS server: %s", exc)
+    except Exception as e:
+        log.warning("HTTPS server failed: %s", e)
 
-    # ── Start WSS server (daemon thread) ──────────────────────────────────────
     try:
         from communication.web_client.ws_bridge import start_ws_server
         start_ws_server(server, HOST, WSS_PORT)
-        log.info("WSS server started on port %d", WSS_PORT)
-    except Exception as exc:
-        log.warning("Could not start WSS server: %s", exc)
+    except Exception as e:
+        log.warning("WSS server failed: %s", e)
 
-    # ── Print banner ─────────────────────────────────────────────────────
-    tls_status  = "ON" if server._ssl_ctx else "OFF (run generate_certs.py to enable)"
-    auth_status = f"ON  (PSK set)" if NETWORK_PSK else "OFF (open network)"
-    print(f"\n{'='*64}")
-    print(f"  NIDS Private Network Server  —  SECURE MODE")
-    print(f"{'='*64}")
-    print(f"  TCP   (Python clients): {local_ip}:{PORT}  | TLS: {tls_status}")
-    print(f"  HTTPS (Browser UI)    : https://{local_ip}:{HTTPS_PORT}")
-    print(f"  WSS   (Real-time)     : wss://{local_ip}:{WSS_PORT}")
-    print(f"  HTTP  (auto-redirect) : http://{local_ip}:{WEB_PORT}  -> HTTPS")
-    print(f"  Auth  (PSK)           : {auth_status}")
-    print(f"{'='*64}")
-    print(f"  Open any browser on the LAN and go to:")
-    print(f"      https://{local_ip}:{HTTPS_PORT}")
-    print(f"  (Accept the self-signed cert warning once)")
-    print(f"{'='*64}")
-    print(f"  Press Ctrl+C to stop\n")
+    tls  = "ON" if server._ssl_ctx else "OFF"
+    auth = "ON (PSK set)" if NETWORK_PSK else "OFF (open)"
+    print(f"\n{'='*56}")
+    print(f"  NIDS Server  |  TLS: {tls}  |  Auth: {auth}")
+    print(f"  TCP  : {local}:{PORT}")
+    print(f"  HTTPS: https://{local}:{HTTPS_PORT}")
+    print(f"  WSS  : wss://{local}:{WSS_PORT}")
+    print(f"  HTTP : http://{local}:{WEB_PORT} → HTTPS")
+    print(f"  Browser: https://{local}:{HTTPS_PORT}")
+    print(f"{'='*56}\n")
 
-    # ── Start TCP server (blocks main thread) ────────────────────────────
     try:
         server.start()
     except KeyboardInterrupt:
-        print("\n\nCtrl+C received — shutting down gracefully...")
+        print("\nShutting down...")
         server.stop()
-        log.info("Server shutdown complete.")
-        sys.exit(0)
 
 
 if __name__ == "__main__":

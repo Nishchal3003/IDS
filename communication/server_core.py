@@ -1,37 +1,7 @@
-"""
-server_core.py
---------------
-Core server logic for the Intelligent-NIDS private communication network.
+"""Core server logic for the Intelligent-NIDS private communication network."""
 
-Architecture
-------------
-The ``NIDSServer`` class owns exactly one TCP listening socket and
-maintains a registry of ``ClientSession`` objects – one per connected
-peer.  Each ``ClientSession`` runs in its own daemon thread so that
-slow or stalled clients never block the others.
-
-Thread model
-~~~~~~~~~~~~
-  Main thread  →  accept_loop()  →  spawns  ClientSession.handle()  threads
-  Each ClientSession thread  →  recv_frame() loop  →  dispatches by msg_type
-  Heartbeat thread  →  periodic PING to every session
-
-Why this design?
-  •  Thread-per-client is simple to reason about and sufficient for the
-     handful of devices (≤ MAX_CLIENTS) on a LAN.
-  •  A shared lock (``_sessions_lock``) guards the sessions dict; no other
-     shared mutable state exists.
-  •  All socket I/O is encapsulated here; no raw socket calls leak into
-     server.py.
-
-File-transfer state
-~~~~~~~~~~~~~~~~~~~
-A ``FileReceiveState`` dataclass tracks in-progress downloads per session.
-This prevents partial writes if two transfers happen simultaneously.
-"""
-
+import base64
 import math
-import os
 import socket
 import threading
 import time
@@ -40,43 +10,27 @@ from pathlib import Path
 from typing import Optional
 
 from communication.constants import (
-    HEARTBEAT_INTERVAL,
-    MAX_CLIENTS,
-    MAX_FILE_SIZE,
-    MsgType,
-    SOCKET_TIMEOUT,
-    TRUST_INITIAL,
-    USE_TLS,
-    FILE_CHUNK_SIZE,
+    FILE_CHUNK_SIZE, HEARTBEAT_INTERVAL, MAX_CLIENTS, MAX_FILE_SIZE,
+    MsgType, SOCKET_TIMEOUT, TRUST_INITIAL, USE_TLS,
 )
 from communication.logger import get_logger
 from communication.protocol import (
-    Frame, build_text_frame, build_frame, recv_frame, build_file_chunk_frame,
+    Frame, build_frame, build_file_chunk_frame, build_text_frame,
+    recv_frame,
 )
-from communication.tls import certs_exist, server_ssl_context
+from communication.security import certs_exist, server_ssl_context
 from communication.utils import (
-    format_size,
-    get_file_chunks,
-    get_local_ip,
-    is_lan_peer,
-    safe_send,
-    timestamp_to_str,
-    validate_file_for_transfer,
+    format_size, get_file_chunks, get_local_ip, is_lan_peer,
+    safe_send, timestamp_to_str, validate_file_for_transfer,
 )
 
 log = get_logger("server")
-
-# Received files are saved here
-PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
-RECEIVED_DIR: Path = PROJECT_ROOT / "received_files" / "server"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RECEIVED_DIR = PROJECT_ROOT / "received_files" / "server"
 
 
-# ---------------------------------------------------------------------------
-# File receive state
-# ---------------------------------------------------------------------------
 @dataclass
 class FileReceiveState:
-    """Tracks an in-progress file download from one client."""
     file_name: str
     total_chunks: int
     received_chunks: int = 0
@@ -87,60 +41,29 @@ class FileReceiveState:
         return self.received_chunks >= self.total_chunks
 
 
-# ---------------------------------------------------------------------------
-# Client session
-# ---------------------------------------------------------------------------
 class ClientSession:
-    """
-    Manages the lifecycle of a single connected client.
+    """Manages one connected TCP client in its own daemon thread."""
 
-    One instance is created per accepted connection.  ``handle()`` is
-    intended to run in a dedicated daemon thread.
-
-    Attributes
-    ----------
-    alias       : str       – human-readable device name supplied at HELLO
-    address     : tuple     – (ip, port) of the remote socket
-    trust_score : int       – 0-100 IDS-managed trust level
-    connected_at: float     – Unix epoch of connection time
-    """
-
-    def __init__(
-        self,
-        conn: socket.socket,
-        address: tuple,
-        server: "NIDSServer",
-    ) -> None:
-        self._conn: socket.socket = conn
-        self.address: tuple       = address
-        self._server: "NIDSServer" = server
-
-        self.alias: str           = f"unknown@{address[0]}"
-        self.trust_score: int     = TRUST_INITIAL
-        self.connected_at: float  = time.time()
-
+    def __init__(self, conn: socket.socket, address: tuple, server: "NIDSServer") -> None:
+        self._conn   = conn
+        self.address = address
+        self._server = server
+        self.alias        = f"unknown@{address[0]}"
+        self.trust_score  = TRUST_INITIAL
+        self.connected_at = time.time()
         self._file_state: Optional[FileReceiveState] = None
-        self._alive: bool = True
+        self._alive = True
+        log.info("New session for %s:%s", *address)
 
-        log.info("New session object for %s:%s", *address)
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
     def send(self, data: bytes) -> bool:
-        """Send pre-built frame bytes to this client."""
-        if not self._alive:
-            return False
-        return safe_send(self._conn, data)
+        return safe_send(self._conn, data) if self._alive else False
 
     def disconnect(self, reason: str = "server request") -> None:
-        """Gracefully close this session."""
         if not self._alive:
             return
         self._alive = False
         try:
-            bye = build_text_frame(MsgType.DISCONNECT, "server", reason)
-            self._conn.sendall(bye)
+            self._conn.sendall(build_text_frame(MsgType.DISCONNECT, "server", reason))
         except OSError:
             pass
         finally:
@@ -148,34 +71,25 @@ class ClientSession:
             log.info("Session %s disconnected (%s)", self.alias, reason)
 
     def handle(self) -> None:
-        """
-        Main receive loop.  Runs in its own thread.
-
-        Reads frames one-by-one, dispatches to the appropriate handler,
-        and cleans up the session when the loop exits.
-        """
+        """Main receive loop — runs in a dedicated daemon thread."""
         self._conn.settimeout(SOCKET_TIMEOUT)
         try:
             while self._alive:
                 frame = recv_frame(self._conn)
                 if frame is None:
-                    log.info("%s closed connection", self.alias)
-                    break
+                    log.info("%s closed connection", self.alias); break
                 self._dispatch(frame)
-        except ConnectionError as exc:
-            log.warning("Connection error for %s: %s", self.alias, exc)
-        except ValueError as exc:
-            log.error("Protocol error from %s: %s", self.alias, exc)
-        except OSError as exc:
-            if self._alive:          # ignore errors during intentional shutdown
-                log.error("Socket error for %s: %s", self.alias, exc)
+        except ConnectionError as e:
+            log.warning("Connection error for %s: %s", self.alias, e)
+        except ValueError as e:
+            log.error("Protocol error from %s: %s", self.alias, e)
+        except OSError as e:
+            if self._alive:
+                log.error("Socket error for %s: %s", self.alias, e)
         finally:
             self._alive = False
             self._server.remove_session(self)
 
-    # ------------------------------------------------------------------
-    # Frame dispatcher
-    # ------------------------------------------------------------------
     def _dispatch(self, frame: Frame) -> None:
         handlers = {
             MsgType.HELLO     : self._handle_hello,
@@ -187,532 +101,267 @@ class ClientSession:
             MsgType.FILE_DONE : self._handle_file_done,
             MsgType.DISCONNECT: self._handle_disconnect,
         }
-        handler = handlers.get(frame.msg_type)
-        if handler:
-            handler(frame)
+        h = handlers.get(frame.msg_type)
+        if h:
+            h(frame)
         else:
-            log.warning(
-                "%s sent unhandled msg_type: %s",
-                self.alias, frame.msg_type
-            )
+            log.warning("%s sent unhandled msg_type: %s", self.alias, frame.msg_type)
 
-    # ------------------------------------------------------------------
-    # Message handlers
-    # ------------------------------------------------------------------
     def _handle_hello(self, frame: Frame) -> None:
-        requested_alias = frame.text.strip() or f"device-{self.address[0]}"
-        # Ensure alias is unique across sessions
+        alias = frame.text.strip() or f"device-{self.address[0]}"
         existing = [s.alias for s in self._server.sessions.values()]
-        if requested_alias in existing:
-            requested_alias = f"{requested_alias}-{self.address[1]}"
-        self.alias = requested_alias
+        if alias in existing:
+            alias = f"{alias}-{self.address[1]}"
+        self.alias = alias
         log.info("HELLO from %s (%s:%s)", self.alias, *self.address)
-
-        # Acknowledge with WELCOME + peer list
-        peers = [
-            s.alias
-            for s in self._server.sessions.values()
-            if s is not self
-        ]
-        welcome = build_text_frame(
-            MsgType.WELCOME,
-            "server",
-            f"Welcome to NIDS-Net, {self.alias}!",
-            extra={"peers": peers},
-        )
-        self.send(welcome)
-
-        # Notify all other clients about the newcomer
-        join_notice = build_text_frame(
-            MsgType.PEER_JOIN,
-            "server",
-            f"{self.alias} joined the network",
-            extra={"alias": self.alias, "ip": self.address[0]},
-        )
-        self._server.broadcast(join_notice, exclude=self)
+        peers = [s.alias for s in self._server.sessions.values() if s is not self]
+        self.send(build_text_frame(MsgType.WELCOME, "server",
+                                   f"Welcome to NIDS-Net, {self.alias}!",
+                                   extra={"peers": peers}))
+        self._server.broadcast(
+            build_text_frame(MsgType.PEER_JOIN, "server", f"{self.alias} joined the network",
+                             extra={"alias": self.alias, "ip": self.address[0]}),
+            exclude=self)
 
     def _handle_ping(self, frame: Frame) -> None:
-        pong = build_text_frame(MsgType.PONG, "server", "")
-        self.send(pong)
+        self.send(build_text_frame(MsgType.PONG, "server", ""))
 
     def _handle_pong(self, frame: Frame) -> None:
         log.debug("PONG from %s", self.alias)
 
     def _handle_chat(self, frame: Frame) -> None:
-        text = frame.text
-        log.info("[CHAT] %s → broadcast: %s", self.alias, text)
-        relay = build_text_frame(
-            MsgType.BROADCAST,
-            self.alias,
-            text,
-            extra={"from": self.alias, "time": timestamp_to_str(frame.timestamp)},
-        )
-        self._server.broadcast(relay, exclude=None)   # echo back to sender too
+        log.info("[CHAT] %s → broadcast: %s", self.alias, frame.text)
+        self._server.broadcast(build_text_frame(
+            MsgType.BROADCAST, self.alias, frame.text,
+            extra={"from": self.alias, "time": timestamp_to_str(frame.timestamp)}))
 
     def _handle_file_meta(self, frame: Frame) -> None:
-        file_name   = frame.extra.get("file_name", "unknown")
-        file_size   = frame.extra.get("file_size", 0)
-        total_chunks = frame.extra.get("total_chunks", 0)
-        log.info(
-            "[FILE] %s → sending '%s' (%s, %d chunks)",
-            self.alias, file_name, format_size(file_size), total_chunks,
-        )
-        self._file_state = FileReceiveState(
-            file_name=file_name,
-            total_chunks=total_chunks,
-        )
-        ack = build_text_frame(MsgType.ACK, "server", "FILE_META received")
-        self.send(ack)
+        name   = frame.extra.get("file_name", "unknown")
+        size   = frame.extra.get("file_size", 0)
+        chunks = frame.extra.get("total_chunks", 0)
+        log.info("[FILE] %s → '%s' (%s, %d chunks)", self.alias, name, format_size(size), chunks)
+        self._file_state = FileReceiveState(file_name=name, total_chunks=chunks)
+        self.send(build_text_frame(MsgType.ACK, "server", "FILE_META received"))
 
     def _handle_file_chunk(self, frame: Frame) -> None:
         if self._file_state is None:
-            log.warning("%s sent FILE_CHUNK without FILE_META", self.alias)
-            return
+            log.warning("%s sent FILE_CHUNK without FILE_META", self.alias); return
         self._file_state.buffer.extend(frame.payload)
         self._file_state.received_chunks += 1
-        # Acknowledge every chunk (simple stop-and-wait)
-        ack = build_text_frame(
-            MsgType.FILE_ACK,
-            "server",
-            str(frame.extra.get("chunk_index", -1)),
-        )
-        self.send(ack)
+        self.send(build_text_frame(MsgType.FILE_ACK, "server",
+                                   str(frame.extra.get("chunk_index", -1))))
 
     def _handle_file_done(self, frame: Frame) -> None:
         if self._file_state is None:
-            log.warning("%s sent FILE_DONE without FILE_META", self.alias)
-            return
-        state = self._file_state
-        self._file_state = None   # clear early so re-entrant calls are safe
+            log.warning("%s sent FILE_DONE without FILE_META", self.alias); return
+        state, self._file_state = self._file_state, None
+        data = bytes(state.buffer)
+        size = len(data)
 
-        file_data = bytes(state.buffer)
-        file_size = len(file_data)
-
-        # 1. Save on server ──────────────────────────────────────────────
+        # Save to server
         RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
-        dest = RECEIVED_DIR / state.file_name
         try:
-            dest.write_bytes(file_data)
-        except OSError as exc:
-            log.error("[FILE] Could not save '%s': %s", state.file_name, exc)
-            self.send(build_text_frame(MsgType.ACK, "server",
-                                       f"ERROR: Could not save file: {exc}"))
-            return
+            (RECEIVED_DIR / state.file_name).write_bytes(data)
+        except OSError as e:
+            log.error("[FILE] Could not save '%s': %s", state.file_name, e)
+            self.send(build_text_frame(MsgType.ACK, "server", f"ERROR: {e}")); return
 
-        log.info(
-            "[FILE] Saved '%s' (%s) from %s -> relaying to %d peer(s)",
-            state.file_name, format_size(file_size), self.alias,
-            len(self._server.sessions) - 1,
-        )
+        log.info("[FILE] Saved '%s' (%s) from %s", state.file_name, format_size(size), self.alias)
+        self.send(build_text_frame(MsgType.ACK, "server",
+                                   f"File '{state.file_name}' received ({format_size(size)}) -- relaying"))
 
-        # Acknowledge receipt to the sender before starting relay
-        self.send(build_text_frame(
-            MsgType.ACK, "server",
-            f"File '{state.file_name}' received ({format_size(file_size)}) -- relaying to peers"
-        ))
-
-        # 2. Relay in a background thread so we don't block this session ──
-        other_sessions = [
-            s for s in self._server.sessions.values() if s is not self
-        ]
-        if not other_sessions:
-            # Notify only sender if no peers
+        others = [s for s in self._server.sessions.values() if s is not self]
+        if not others:
             self._server.broadcast(build_text_frame(
                 MsgType.BROADCAST, "server",
-                f"{self.alias} shared '{state.file_name}' ({format_size(file_size)}) "
-                f"-- no other peers online",
-                extra={"from": "server", "time": timestamp_to_str(time.time())},
-            ))
+                f"{self.alias} shared '{state.file_name}' — no other peers online",
+                extra={"from": "server", "time": timestamp_to_str(time.time())}))
             return
 
-        tcp_peers     = [s for s in other_sessions if not hasattr(s, "_is_browser")]
-        browser_peers = [s for s in other_sessions if hasattr(s, "_is_browser")]
-        total_chunks  = math.ceil(file_size / FILE_CHUNK_SIZE) or 1
+        tcp_peers     = [s for s in others if not hasattr(s, "_is_browser")]
+        browser_peers = [s for s in others if hasattr(s, "_is_browser")]
+        total_chunks  = math.ceil(size / FILE_CHUNK_SIZE) or 1
 
-        def _do_relay() -> None:
-            """Run in a daemon thread: relay file to all TCP and browser peers."""
-            # ── TCP peers: FILE_META -> FILE_CHUNK × N -> FILE_DONE ────────
+        def _relay():
             if tcp_peers:
-                meta_frame = build_text_frame(
+                meta = build_text_frame(
                     MsgType.FILE_META, self.alias, state.file_name,
-                    extra={
-                        "file_name"   : state.file_name,
-                        "file_size"   : file_size,
-                        "total_chunks": total_chunks,
-                        "from"        : self.alias,
-                    },
-                )
+                    extra={"file_name": state.file_name, "file_size": size,
+                           "total_chunks": total_chunks, "from": self.alias})
                 for s in list(tcp_peers):
-                    try:
-                        s.send(meta_frame)
-                    except Exception as exc:
-                        log.warning("[FILE] META relay to %s failed: %s", s.alias, exc)
-
-                log_step = max(1, total_chunks // 10)   # log every ~10 %
-                for chunk_idx in range(total_chunks):
-                    start = chunk_idx * FILE_CHUNK_SIZE
-                    end   = start + FILE_CHUNK_SIZE
+                    try: s.send(meta)
+                    except Exception as e: log.warning("[FILE] META→%s failed: %s", s.alias, e)
+                for i in range(total_chunks):
                     chunk_frame = build_file_chunk_frame(
-                        self.alias,
-                        file_data[start:end],
-                        file_name=state.file_name,
-                        chunk_index=chunk_idx,
-                        total_chunks=total_chunks,
-                    )
+                        self.alias, data[i*FILE_CHUNK_SIZE:(i+1)*FILE_CHUNK_SIZE],
+                        state.file_name, i, total_chunks)
                     for s in list(tcp_peers):
-                        try:
-                            s.send(chunk_frame)
-                        except Exception as exc:
-                            log.warning("[FILE] CHUNK %d relay to %s failed: %s",
-                                        chunk_idx, s.alias, exc)
-                    if chunk_idx % log_step == 0:
-                        pct = int(chunk_idx / total_chunks * 100)
-                        log.debug("[FILE] Relay '%s' -> %d%% (%d/%d chunks)",
-                                  state.file_name, pct, chunk_idx, total_chunks)
-
-                done_frame = build_text_frame(
-                    MsgType.FILE_DONE, self.alias, state.file_name
-                )
+                        try: s.send(chunk_frame)
+                        except Exception as e: log.warning("[FILE] CHUNK%d→%s: %s", i, s.alias, e)
+                done = build_text_frame(MsgType.FILE_DONE, self.alias, state.file_name)
                 for s in list(tcp_peers):
-                    try:
-                        s.send(done_frame)
-                    except Exception as exc:
-                        log.warning("[FILE] DONE relay to %s failed: %s", s.alias, exc)
-
-            # ── Browser peers: single FILE_INCOMING frame (base64 payload) ─
+                    try: s.send(done)
+                    except Exception as e: log.warning("[FILE] DONE→%s: %s", s.alias, e)
             if browser_peers:
-                import base64 as _b64
-                incoming_frame = build_frame(
-                    MsgType.FILE_INCOMING, self.alias,
-                    _b64.b64encode(file_data),
-                    extra={
-                        "file_name": state.file_name,
-                        "file_size": file_size,
-                        "from"     : self.alias,
-                    },
-                )
+                incoming = build_frame(
+                    MsgType.FILE_INCOMING, self.alias, base64.b64encode(data),
+                    extra={"file_name": state.file_name, "file_size": size, "from": self.alias})
                 for s in list(browser_peers):
-                    try:
-                        s.send(incoming_frame)
-                    except Exception as exc:
-                        log.warning("[FILE] INCOMING relay to browser %s failed: %s",
-                                    getattr(s, "alias", "?"), exc)
+                    try: s.send(incoming)
+                    except Exception as e: log.warning("[FILE] INCOMING→%s: %s", getattr(s,"alias","?"), e)
+            log.info("[FILE] Relay '%s' done. TCP=%d Browser=%d", state.file_name, len(tcp_peers), len(browser_peers))
 
-            log.info("[FILE] Relay of '%s' complete. TCP=%d Browser=%d",
-                     state.file_name, len(tcp_peers), len(browser_peers))
-
-        relay_thread = threading.Thread(
-            target=_do_relay, daemon=True,
-            name=f"file-relay-{state.file_name[:20]}"
-        )
-        relay_thread.start()
-
-        # 3. Notify all peers (including sender) in chat right away
-        notify = build_text_frame(
+        threading.Thread(target=_relay, daemon=True, name=f"relay-{state.file_name[:16]}").start()
+        self._server.broadcast(build_text_frame(
             MsgType.BROADCAST, "server",
-            f"{self.alias} shared '{state.file_name}' ({format_size(file_size)}) "
-            f"-- available to all peers",
-            extra={"from": "server", "time": timestamp_to_str(time.time())},
-        )
-        self._server.broadcast(notify)
+            f"{self.alias} shared '{state.file_name}' ({format_size(size)}) — available to all",
+            extra={"from": "server", "time": timestamp_to_str(time.time())}))
 
     def _handle_disconnect(self, frame: Frame) -> None:
         log.info("%s sent DISCONNECT: %s", self.alias, frame.text)
         self._alive = False
 
 
-# ---------------------------------------------------------------------------
-# Server
-# ---------------------------------------------------------------------------
 class NIDSServer:
-    """
-    Multi-client TCP server for the NIDS private communication network.
-
-    Usage
-    -----
-    ::
-        server = NIDSServer(host="0.0.0.0", port=5000)
-        server.start()          # blocks until KeyboardInterrupt / stop()
-    """
+    """Multi-client TCP server for the NIDS private network."""
 
     def __init__(self, host: str, port: int) -> None:
-        self._host: str  = host
-        self._port: int  = port
+        self._host, self._port = host, port
         self._server_sock: Optional[socket.socket] = None
-        self._running: bool = False
-
-        # Detect server's own LAN IP for LAN-only enforcement
-        self._local_ip: str = get_local_ip()
-
-        # Load LAN-only mode from config
+        self._running = False
+        self._local_ip = get_local_ip()
         try:
             from config.network_config import LAN_ONLY_MODE
-            self._lan_only: bool = LAN_ONLY_MODE
+            self._lan_only = LAN_ONLY_MODE
         except ImportError:
-            self._lan_only: bool = True   # safe default
-
-        # TLS context — created once if certs are available
+            self._lan_only = True
         self._ssl_ctx = None
         if USE_TLS:
             if certs_exist():
                 self._ssl_ctx = server_ssl_context()
-                log.info("TLS enabled — all TCP connections will be encrypted")
+                log.info("TLS enabled")
             else:
-                log.warning(
-                    "USE_TLS=True but certs not found. "
-                    "Run: python -m communication.generate_certs"
-                )
-
-        # sessions dict:  conn_fileno → ClientSession (or BrowserSession)
-        # BrowserSessions use negative keys (e.g. -1, -2, ...) so they
-        # never collide with real OS file descriptors (always >= 0).
+                log.warning("USE_TLS=True but certs not found. Run: python -m communication.generate_certs")
+        # BrowserSessions get negative keys to avoid collision with TCP file descriptors
         self._sessions: dict[int, ClientSession] = {}
-        self._sessions_lock: threading.Lock = threading.Lock()
-        self._browser_session_counter: int = 0  # decrements for each browser session
+        self._sessions_lock = threading.Lock()
+        self._browser_session_counter = 0
 
-    # ------------------------------------------------------------------
-    # Public read-only view of sessions
-    # ------------------------------------------------------------------
     @property
     def sessions(self) -> dict[int, "ClientSession"]:
-        """Return a snapshot of active sessions (thread-safe)."""
         with self._sessions_lock:
             return dict(self._sessions)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
     def start(self) -> None:
-        """
-        Bind the server socket and enter the accept loop.
-
-        This method blocks the calling thread.  Call it from your
-        main thread and handle ``KeyboardInterrupt`` there.
-        """
+        """Bind socket, print banner, start heartbeat, enter accept loop (blocks)."""
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((self._host, self._port))
-        # Use a generous backlog (128) so pending handshakes don’t drop;
-        # MAX_CLIENTS limits *accepted/active* sessions, not the queue.
-        self._server_sock.listen(128)
+        self._server_sock.listen(128)   # generous backlog; MAX_CLIENTS limits active sessions
         self._server_sock.settimeout(1.0)
         self._running = True
-
-        log.info(
-            "NIDS Server listening on %s:%s (max %d clients) | TLS: %s | LAN-only: %s",
-            self._host, self._port, MAX_CLIENTS,
-            "ON" if self._ssl_ctx else "OFF",
-            "ON" if self._lan_only else "OFF",
-        )
-        print(f"\n{'='*60}")
-        print(f"  NIDS Private Network Server")
-        print(f"  TCP  (Python clients) : {self._host}:{self._port}  |  TLS: {'ON' if self._ssl_ctx else 'OFF'}")
-        print(f"  Server IP (LAN)       : {self._local_ip}")
-        print(f"  Max clients           : {MAX_CLIENTS} (TCP + browser combined)")
-        print(f"  LAN-only mode         : {'ENABLED  -- outside IPs rejected' if self._lan_only else 'DISABLED'}")
-        print(f"  Press Ctrl+C to stop")
-        print(f"{'='*60}\n")
-
-        # Start heartbeat thread
-        hb = threading.Thread(
-            target=self._heartbeat_loop, daemon=True, name="heartbeat"
-        )
-        hb.start()
-
+        tls_s = "ON" if self._ssl_ctx else "OFF"
+        lan_s = "ENABLED" if self._lan_only else "DISABLED"
+        log.info("NIDS Server on %s:%s | max=%d | TLS=%s | LAN-only=%s",
+                 self._host, self._port, MAX_CLIENTS, tls_s, lan_s)
+        print(f"\n{'='*55}")
+        print(f"  NIDS Server  |  TCP: {self._host}:{self._port}  |  TLS: {tls_s}")
+        print(f"  LAN IP: {self._local_ip}  |  Max clients: {MAX_CLIENTS}  |  LAN-only: {lan_s}")
+        print(f"  Press Ctrl+C to stop\n{'='*55}\n")
+        threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
         self._accept_loop()
 
     def stop(self) -> None:
-        """Signal the server to stop accepting new connections."""
-        log.info("Server stop requested")
         self._running = False
-        if self._server_sock:
-            try:
-                self._server_sock.close()
-            except OSError:
-                pass
+        try:
+            if self._server_sock: self._server_sock.close()
+        except OSError:
+            pass
 
-    # ------------------------------------------------------------------
-    # Accept loop
-    # ------------------------------------------------------------------
     def _accept_loop(self) -> None:
-        """Block and accept incoming connections until stopped."""
         while self._running:
             try:
                 conn, addr = self._server_sock.accept()
             except socket.timeout:
-                continue   # socket was closed by stop()
-
-            client_ip = addr[0]
-
-            # ── LAN-only guard ─────────────────────────────────────────────
-            if self._lan_only and not is_lan_peer(client_ip, self._local_ip):
-                log.warning(
-                    "Rejecting %s:%s — not on local network (LAN-only mode)",
-                    *addr,
-                )
+                continue
+            ip = addr[0]
+            if self._lan_only and not is_lan_peer(ip, self._local_ip):
+                log.warning("Rejecting %s — not on LAN", ip)
                 try:
-                    reject_msg = build_text_frame(
-                        MsgType.ERROR, "server",
-                        "Connection rejected: this server only accepts LAN connections.",
-                    )
-                    conn.sendall(reject_msg)
+                    conn.sendall(build_text_frame(MsgType.ERROR, "server",
+                                                  "Rejected: LAN-only server."))
                 except OSError:
                     pass
-                finally:
-                    conn.close()
-                continue
+                conn.close(); continue
 
             with self._sessions_lock:
-                # ── Capacity guard ─────────────────────────────────────────
                 if len(self._sessions) >= MAX_CLIENTS:
-                    log.warning(
-                        "Rejecting %s:%s – server full (%d/%d)",
-                        *addr, len(self._sessions), MAX_CLIENTS,
-                    )
+                    n = len(self._sessions)
+                    log.warning("Rejecting %s — server full (%d/%d)", ip, n, MAX_CLIENTS)
                     try:
-                        full_msg = build_text_frame(
+                        conn.sendall(build_text_frame(
                             MsgType.SERVER_FULL, "server",
-                            f"Server is full ({len(self._sessions)}/{MAX_CLIENTS} clients). Try again later."
-                        )
-                        conn.sendall(full_msg)
+                            f"Server full ({n}/{MAX_CLIENTS}). Try later."))
                     finally:
                         conn.close()
                     continue
-
                 session = ClientSession(conn, addr, self)
                 self._sessions[conn.fileno()] = session
 
-            # Wrap with TLS AFTER the session is created so that the
-            # handshake happens in the session thread, not the accept thread.
             if self._ssl_ctx:
                 try:
                     tls_conn = self._ssl_ctx.wrap_socket(conn, server_side=True)
-                    session._conn = tls_conn   # replace the raw socket
-                except Exception as exc:
-                    log.error("TLS handshake failed for %s:%s — %s", *addr, exc)
+                    session._conn = tls_conn
+                except Exception as e:
+                    log.error("TLS handshake failed for %s: %s", ip, e)
                     with self._sessions_lock:
                         self._sessions.pop(conn.fileno(), None)
-                    conn.close()
-                    continue
+                    conn.close(); continue
 
-            thread = threading.Thread(
-                target=session.handle,
-                daemon=True,
-                name=f"session-{addr[0]}-{addr[1]}",
-            )
-            thread.start()
-            log.info("Accepted connection from %s:%s", *addr)
+            threading.Thread(target=session.handle, daemon=True,
+                             name=f"session-{ip}").start()
+            log.info("Accepted %s:%s", *addr)
 
-    # ------------------------------------------------------------------
-    # Broadcast
-    # ------------------------------------------------------------------
-    def broadcast(
-        self,
-        data: bytes,
-        exclude: Optional["ClientSession"] = None,
-    ) -> None:
-        """
-        Send *data* to every connected client, optionally excluding one.
-
-        Parameters
-        ----------
-        data : bytes
-            Pre-built frame bytes.
-        exclude : ClientSession | None
-            If provided, this session will NOT receive the broadcast.
-        """
+    def broadcast(self, data: bytes, exclude: Optional["ClientSession"] = None) -> None:
         with self._sessions_lock:
             targets = list(self._sessions.values())
-        for session in targets:
-            if session is not exclude:
-                session.send(data)
+        for s in targets:
+            if s is not exclude:
+                s.send(data)
 
-    # ------------------------------------------------------------------
-    # Session management
-    # ------------------------------------------------------------------
     def remove_session(self, session: "ClientSession") -> None:
-        """Remove a disconnected session and notify remaining peers."""
-        fd = getattr(session, "_browser_key", None)
-        if fd is None:
-            fd = session._conn.fileno()
+        fd = getattr(session, "_browser_key", None) or session._conn.fileno()
         with self._sessions_lock:
             self._sessions.pop(fd, None)
-
-        leave_notice = build_text_frame(
-            MsgType.PEER_LEAVE,
-            "server",
-            f"{session.alias} left the network",
-            extra={"alias": session.alias},
-        )
-        self.broadcast(leave_notice)
-        log.info(
-            "Session removed: %s | Active clients: %d",
-            session.alias, len(self._sessions),
-        )
+        self.broadcast(build_text_frame(MsgType.PEER_LEAVE, "server",
+                                        f"{session.alias} left",
+                                        extra={"alias": session.alias}))
+        log.info("Session removed: %s | Active: %d", session.alias, len(self._sessions))
 
     def register_browser_session(self, session: "ClientSession") -> int:
-        """
-        Register a BrowserSession in the shared session registry.
-
-        Browser sessions use negative integer keys so they never clash
-        with real OS file descriptors (which are always >= 0).
-
-        Parameters
-        ----------
-        session : BrowserSession
-            The session object to register.
-
-        Returns
-        -------
-        int
-            The unique negative key assigned to this session.
-        """
         with self._sessions_lock:
             self._browser_session_counter -= 1
             key = self._browser_session_counter
             session._browser_key = key
             self._sessions[key] = session
-        log.info("Browser session registered: key=%d  alias=%s", key, session.alias)
+        log.info("Browser registered: key=%d alias=%s", key, session.alias)
         return key
 
     def unregister_browser_session(self, session: "ClientSession") -> None:
-        """Remove a BrowserSession and broadcast PEER_LEAVE."""
         self.remove_session(session)
 
-    # ------------------------------------------------------------------
-    # Heartbeat
-    # ------------------------------------------------------------------
     def _heartbeat_loop(self) -> None:
-        """Send PING to every client every HEARTBEAT_INTERVAL seconds."""
+        ping = build_text_frame(MsgType.PING, "server", "")
         while self._running:
             time.sleep(HEARTBEAT_INTERVAL)
-            ping = build_text_frame(MsgType.PING, "server", "")
             with self._sessions_lock:
                 targets = list(self._sessions.values())
-            for session in targets:
-                session.send(ping)
-            if targets:
-                log.debug("Heartbeat sent to %d client(s)", len(targets))
+            for s in targets:
+                s.send(ping)
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
     def status(self) -> dict:
-        """Return a dict of current server state (for dashboard use)."""
         with self._sessions_lock:
-            peers = [
-                {
-                    "alias"      : s.alias,
-                    "ip"         : s.address[0],
-                    "port"       : s.address[1],
-                    "trust_score": s.trust_score,
-                    "connected_at": timestamp_to_str(s.connected_at),
-                }
-                for s in self._sessions.values()
-            ]
-        return {
-            "host"         : self._host,
-            "port"         : self._port,
-            "client_count" : len(peers),
-            "clients"      : peers,
-        }
+            peers = [{"alias": s.alias, "ip": s.address[0], "port": s.address[1],
+                      "trust": s.trust_score, "since": timestamp_to_str(s.connected_at)}
+                     for s in self._sessions.values()]
+        return {"host": self._host, "port": self._port, "clients": len(peers), "peers": peers}

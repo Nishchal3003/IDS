@@ -86,7 +86,6 @@ from communication.constants import (
 from communication.logger import get_logger
 from communication.protocol import decode_frame_bytes, build_text_frame
 from communication.security import (
-    verify_auth_token,
     server_ssl_context,
     certs_exist,
 )
@@ -261,26 +260,6 @@ class BrowserSession:
             alias = f"{alias}-{self.address[1]}"
         self.alias = alias
 
-        # ── PSK authentication ────────────────────────────────────────
-        try:
-            from config.network_config import NETWORK_PSK
-        except ImportError:
-            NETWORK_PSK = ""
-
-        if NETWORK_PSK:
-            auth_token = data.get("auth_token", "")
-            if not verify_auth_token(NETWORK_PSK, alias, auth_token):
-                log.warning(
-                    "Browser auth FAILED for alias '%s' from %s",
-                    alias, self.address[0],
-                )
-                await self._ws.send(json.dumps({
-                    "type"   : "ERROR",
-                    "message": "Authentication failed. Wrong network password.",
-                    "pre_login": True,
-                }))
-                self._alive = False
-                return
 
         # ── Capacity check ───────────────────────────────────────────
         current = len(self._server.sessions)

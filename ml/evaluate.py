@@ -25,6 +25,7 @@ warnings.filterwarnings("ignore")
 
 from ml.constants import (
     BEST_MODEL_PATH, CLASSES, FEATURE_COLS, ID_TO_CLASS, REPORTS_DIR,
+    LABEL_ENCODER_PATH,
 )
 from ml.preprocess import run_preprocessing
 
@@ -39,12 +40,12 @@ def _check_matplotlib() -> bool:
         return False
 
 
-def _plot_confusion_matrix(y_test, y_pred, class_names: list[str]) -> None:
+def _plot_confusion_matrix(y_test, y_pred, le) -> None:
     import matplotlib.pyplot as plt
     from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 
     present = sorted(set(y_test) | set(y_pred))
-    names   = [ID_TO_CLASS.get(i, str(i)) for i in present]
+    names   = [ID_TO_CLASS.get(int(le.classes_[i]), str(i)) for i in present]
     cm      = confusion_matrix(y_test, y_pred, labels=present)
 
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -83,7 +84,7 @@ def _plot_feature_importance(model, top_n: int = 25) -> None:
     print(f"  [OK]  Feature importance → {out}")
 
 
-def _plot_roc_curves(model, X_test, y_test, class_names: list[str]) -> None:
+def _plot_roc_curves(model, X_test, y_test, le) -> None:
     import matplotlib.pyplot as plt
     from sklearn.metrics import roc_curve, auc
     from sklearn.preprocessing import label_binarize
@@ -96,19 +97,18 @@ def _plot_roc_curves(model, X_test, y_test, class_names: list[str]) -> None:
     y_bin  = label_binarize(y_test, classes=classes_present)
     y_prob = model.predict_proba(X_test)
 
-    # y_prob columns may not align with all classes — select correct columns
-    all_classes = list(range(len(CLASSES)))
-    # indices of present classes in model's classes_ list
     model_classes = list(getattr(model, "classes_", classes_present))
 
     fig, ax = plt.subplots(figsize=(10, 7))
     colors  = plt.cm.tab10(np.linspace(0, 1, len(classes_present)))
 
-    for j, cls_id in enumerate(classes_present):
-        cls_name = ID_TO_CLASS.get(cls_id, str(cls_id))
-        if cls_id not in model_classes:
+    for j, enc_id in enumerate(classes_present):
+        # Decode encoded ID → original class name via LabelEncoder
+        original_id = int(le.classes_[enc_id]) if enc_id < len(le.classes_) else enc_id
+        cls_name    = ID_TO_CLASS.get(original_id, str(original_id))
+        if enc_id not in model_classes:
             continue
-        col_idx = model_classes.index(cls_id)
+        col_idx = model_classes.index(enc_id)
         if col_idx >= y_prob.shape[1]:
             continue
         fpr, tpr, _ = roc_curve(y_bin[:, j], y_prob[:, col_idx])
@@ -142,12 +142,16 @@ def run_evaluation(verbose: bool = True) -> None:
     model_name = artifact.get("name", "Unknown")
     saved_f1   = artifact.get("f1", 0.0)
 
+    # Load label encoder
+    with open(LABEL_ENCODER_PATH, "rb") as fh:
+        le = pickle.load(fh)
+
     print("\n" + "="*55)
     print(f"  Phase 3 — Evaluation: {model_name}  (saved F1={saved_f1:.4f})")
     print("="*55)
 
-    # Re-run preprocessing to get a fresh test set
-    _, X_test, _, y_test, _ = run_preprocessing(verbose=verbose)
+    # Re-run preprocessing to get a fresh (encoded) test set
+    _, X_test, _, y_test, _, _ = run_preprocessing(verbose=verbose)
 
     from sklearn.metrics import (
         accuracy_score,
@@ -159,11 +163,12 @@ def run_evaluation(verbose: bool = True) -> None:
     acc    = accuracy_score(y_test, y_pred)
     wf1    = f1_score(y_test, y_pred, average="weighted", zero_division=0)
 
-    print(f"\n  Accuracy  : {acc*100:.2f}%")
+    print(f"\n  Accuracy    : {acc*100:.2f}%")
     print(f"  Weighted F1 : {wf1:.4f}")
 
+    # Use LabelEncoder to get human-readable target names
     present      = sorted(set(y_test) | set(y_pred))
-    target_names = [ID_TO_CLASS.get(i, str(i)) for i in present]
+    target_names = [ID_TO_CLASS.get(int(le.classes_[i]), str(i)) for i in present]
 
     print("\n  Per-class metrics:")
     print(classification_report(
@@ -177,9 +182,9 @@ def run_evaluation(verbose: bool = True) -> None:
     has_mpl = _check_matplotlib()
     if has_mpl:
         print("  Generating plots...")
-        _plot_confusion_matrix(y_test, y_pred, CLASSES)
+        _plot_confusion_matrix(y_test, y_pred, le)
         _plot_feature_importance(model)
-        _plot_roc_curves(model, X_test, y_test, CLASSES)
+        _plot_roc_curves(model, X_test, y_test, le)
         print(f"\n  Reports saved to: {REPORTS_DIR}")
 
     print("\n  Evaluation complete!\n")

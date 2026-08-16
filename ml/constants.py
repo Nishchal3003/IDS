@@ -11,9 +11,10 @@ REPORTS_DIR     = PROJECT_ROOT / "ml" / "reports"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-BEST_MODEL_PATH = MODELS_DIR / "best_model.pkl"
-SCALER_PATH     = MODELS_DIR / "scaler.pkl"
-LABEL_MAP_PATH  = MODELS_DIR / "label_map.pkl"
+BEST_MODEL_PATH     = MODELS_DIR / "best_model.pkl"
+SCALER_PATH         = MODELS_DIR / "scaler.pkl"
+LABEL_MAP_PATH      = MODELS_DIR / "label_map.pkl"
+LABEL_ENCODER_PATH  = MODELS_DIR / "label_encoder.pkl"  # sklearn LabelEncoder for consecutive y
 
 # ── Dataset files ──────────────────────────────────────────────────────────
 DATASET_FILES = [

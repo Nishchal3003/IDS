@@ -43,6 +43,7 @@ from ml.constants import (
     XGB_MAX_DEPTH, XGB_N_ESTIMATORS,
 )
 from ml.preprocess import run_preprocessing
+import numpy as np
 
 
 def _build_models() -> list[tuple[str, object]]:
@@ -76,7 +77,7 @@ def _build_models() -> list[tuple[str, object]]:
                 XGBClassifier(
                     n_estimators=XGB_N_ESTIMATORS,
                     max_depth=XGB_MAX_DEPTH,
-                    use_label_encoder=False,
+                    # use_label_encoder removed in XGBoost 2.x
                     eval_metric="mlogloss",
                     random_state=RANDOM_STATE,
                     n_jobs=-1,
@@ -97,6 +98,7 @@ def _train_and_evaluate(
     X_test: np.ndarray,
     y_train: np.ndarray,
     y_test: np.ndarray,
+    le,                      # sklearn LabelEncoder — maps encoded ID → original class name
 ) -> tuple[float, object]:
     """Fit model, print classification report, return (weighted_f1, fitted_model)."""
     print(f"\n  ── Training: {name} ──")
@@ -105,12 +107,14 @@ def _train_and_evaluate(
     elapsed = time.time() - t0
     print(f"     Training time: {elapsed:.1f}s")
 
-    y_pred = model.predict(X_test)
-    f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+    y_pred  = model.predict(X_test)
+    f1      = f1_score(y_test, y_pred, average="weighted", zero_division=0)
 
-    # Build class names list aligned with label IDs present in y_test
-    present = sorted(set(y_test) | set(y_pred))
-    target_names = [ID_TO_CLASS.get(i, str(i)) for i in present]
+    # Build human-readable class names from the LabelEncoder
+    # le.classes_ = original class IDs (e.g. [0,1,2,3,4,6,7])
+    # Encoded values 0..K-1 correspond to le.classes_[0..K-1]
+    present      = sorted(set(y_test) | set(y_pred))
+    target_names = [ID_TO_CLASS.get(int(le.classes_[i]), str(i)) for i in present]
 
     print(f"     Weighted F1  : {f1:.4f}")
     print("\n" + classification_report(
@@ -131,24 +135,24 @@ def save_model(name: str, model, f1: float) -> None:
 
 def run_training(verbose: bool = True) -> None:
     """Full training pipeline: preprocess → train all models → save best."""
-    # ── Load & preprocess ──────────────────────────────────────────────────
-    X_train, X_test, y_train, y_test, _ = run_preprocessing(verbose=verbose)
+    # ── Load & preprocess ───────────────────────────────────────────────────
+    X_train, X_test, y_train, y_test, _, le = run_preprocessing(verbose=verbose)
 
     print("\n" + "="*55)
     print("  Phase 3 — Step 2: Model Training")
     print("="*55)
 
-    # ── Train all models ───────────────────────────────────────────────────
-    models = _build_models()
+    # ── Train all models ──────────────────────────────────────────────────
+    models  = _build_models()
     results: list[tuple[float, str, object]] = []
 
     for name, estimator in models:
         f1, fitted = _train_and_evaluate(
-            name, estimator, X_train, X_test, y_train, y_test
+            name, estimator, X_train, X_test, y_train, y_test, le
         )
         results.append((f1, name, fitted))
 
-    # ── Pick best ─────────────────────────────────────────────────────────
+    # ── Pick best ───────────────────────────────────────────────────────
     results.sort(key=lambda t: t[0], reverse=True)
     best_f1, best_name, best_model = results[0]
 
@@ -160,7 +164,7 @@ def run_training(verbose: bool = True) -> None:
         print(f"    {name:<25}  F1 = {f1:.4f}{marker}")
     print()
 
-    # ── Save best ─────────────────────────────────────────────────────────
+    # ── Save best ───────────────────────────────────────────────────────
     save_model(best_name, best_model, best_f1)
 
     print("\n  Training complete!")

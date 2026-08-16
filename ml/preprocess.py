@@ -9,12 +9,13 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 import pickle
 
 from ml.constants import (
     DATASET_DIR, DATASET_FILES, FEATURE_COLS, LABEL_COL,
-    LABEL_TO_CLASS, CLASS_TO_ID, SCALER_PATH, LABEL_MAP_PATH,
+    LABEL_TO_CLASS, CLASS_TO_ID, ID_TO_CLASS,
+    SCALER_PATH, LABEL_MAP_PATH, LABEL_ENCODER_PATH,
     ROWS_PER_FILE, TEST_SIZE, RANDOM_STATE,
 )
 
@@ -131,29 +132,46 @@ def split_and_scale(
     save_scaler: bool = True,
 ) -> tuple:
     """
-    Stratified train/test split + StandardScaler fit on training data.
+    Stratified train/test split + StandardScaler + LabelEncoder.
+
+    The LabelEncoder step is critical: because ROWS_PER_FILE sampling may not
+    include every attack class, the raw class IDs in y can be non-consecutive
+    (e.g. [0,1,2,3,4,6,7] — missing 5). XGBoost requires consecutive integers
+    starting from 0, so we re-encode y → 0..K-1 before training.
+    The encoder is saved to disk so predict.py can inverse-map model output
+    back to the original CLASSES names.
 
     Returns
     -------
-    X_train, X_test, y_train, y_test (all numpy arrays)
+    X_train, X_test, y_train, y_test (numpy arrays), scaler, label_encoder
     """
+    # ── LabelEncoder: enforce 0..K-1 regardless of which classes are present ──
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y.values)
+    # le.classes_ = sorted array of original class IDs that appear in the data
+    present = [ID_TO_CLASS.get(int(c), str(c)) for c in le.classes_]
+    print(f"  Classes in data ({len(le.classes_)}): {present}")
+
     X_train, X_test, y_train, y_test = train_test_split(
-        X.values, y.values,
+        X.values, y_encoded,
         test_size=test_size,
         random_state=random_state,
-        stratify=y.values,
+        stratify=y_encoded,
     )
 
-    scaler = StandardScaler()
+    scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_test  = scaler.transform(X_test)
 
     if save_scaler:
         with open(SCALER_PATH, "wb") as f:
             pickle.dump(scaler, f)
-        print(f"  [OK]  Scaler saved → {SCALER_PATH}")
+        with open(LABEL_ENCODER_PATH, "wb") as f:
+            pickle.dump(le, f)
+        print(f"  [OK]  Scaler saved  → {SCALER_PATH}")
+        print(f"  [OK]  LabelEncoder → {LABEL_ENCODER_PATH}")
 
-    return X_train, X_test, y_train, y_test, scaler
+    return X_train, X_test, y_train, y_test, scaler, le
 
 
 def run_preprocessing(verbose: bool = True) -> tuple:
@@ -162,7 +180,7 @@ def run_preprocessing(verbose: bool = True) -> tuple:
 
     Returns
     -------
-    X_train, X_test, y_train, y_test, scaler
+    X_train, X_test, y_train, y_test, scaler, label_encoder
     """
     if verbose:
         print("\n" + "="*55)
@@ -177,12 +195,12 @@ def run_preprocessing(verbose: bool = True) -> tuple:
         print(f"  Splitting {int((1-TEST_SIZE)*100)}/{int(TEST_SIZE*100)} train/test (stratified)...")
 
     result = split_and_scale(X, y, save_scaler=True)
-    X_train, X_test, y_train, y_test, scaler = result
+    X_train, X_test, y_train, y_test, scaler, le = result
 
     if verbose:
         print(f"  Train: {len(X_train):,} | Test: {len(X_test):,}")
 
-    return X_train, X_test, y_train, y_test, scaler
+    return X_train, X_test, y_train, y_test, scaler, le
 
 
 if __name__ == "__main__":

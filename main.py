@@ -1,20 +1,15 @@
 """
 main.py
 -------
-Intelligent-NIDS – top-level entry point.
+Intelligent-NIDS — top-level entry point.
 
 Usage
 -----
-Run the server:
-    python main.py server
-
-Run the client:
-    python main.py client
-
-In future phases, additional sub-commands will be added here:
-    python main.py capture     # packet capture daemon
-    python main.py dashboard   # Streamlit dashboard
-    python main.py train       # ML model training
+  python main.py server                    – Start the communication server
+  python main.py client                    – Start an interactive client terminal
+  python main.py capture [options]         – Packet capture daemon (Phase 2)
+  python main.py train                     – Train ML intrusion detection models (Phase 3)
+  python main.py evaluate                  – Evaluate trained model + generate reports (Phase 3)
 """
 
 import sys
@@ -28,15 +23,20 @@ Intelligent Network Intrusion Detection System
 Usage:
   python main.py server                    – Start the NIDS communication server
   python main.py client                    – Start an interactive client terminal
+
   python main.py capture                   – Start packet capture (Phase 2)
   python main.py capture --list            – List available network interfaces
   python main.py capture -i WiFi -d 60     – Capture on WiFi for 60 seconds
   python main.py capture --help            – All capture options
 
+  python main.py train                     – Train ML intrusion detection models (Phase 3)
+  python main.py evaluate                  – Evaluate + generate reports (Phase 3)
+
 Phase 1: Communication Network  [DONE]
 Phase 2: Packet Capture         [DONE]
-Phase 3: ML Pipeline            (coming next)
-Phase 4: Dashboard              (coming next)
+Phase 3: ML Pipeline            [IN PROGRESS]
+Phase 4: Real-time Detection    (coming next)
+Phase 5: Dashboard              (coming next)
 """)
 
 
@@ -57,7 +57,15 @@ def main() -> None:
 
     elif command == "capture":
         from capture.capture_daemon import main as capture_main
-        capture_main(sys.argv[2:])   # forward remaining args (--interface etc.)
+        capture_main(sys.argv[2:])
+
+    elif command == "train":
+        from ml.train import run_training
+        run_training()
+
+    elif command == "evaluate":
+        from ml.evaluate import run_evaluation
+        run_evaluation()
 
     else:
         print(f"  Unknown command: {command!r}")

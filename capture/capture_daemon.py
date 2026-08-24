@@ -54,6 +54,37 @@ from capture.capture_logger import CaptureLogger
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 live inference hook
+# ---------------------------------------------------------------------------
+
+def _make_live_hook(engine, bridge, tracker):
+    """
+    Return an on_flow_completed callback that feeds each completed flow
+    through LiveInferenceEngine and pushes the result to DashboardBridge.
+    """
+    def _hook(flow_dict: dict) -> None:
+        try:
+            result = engine.process_flow(flow_dict)
+            bridge.update(
+                result,
+                packet_count = 1,
+                active_flows = tracker.active_flow_count,
+            )
+            if result.get("is_attack"):
+                print(
+                    "  [ALERT] {} | {} -> {} | {}".format(
+                        result.get("final_decision"),
+                        result.get("src_ip"),
+                        result.get("dst_ip"),
+                        result.get("detection_reason"),
+                    )
+                )
+        except Exception:
+            pass  # never let detection errors crash the capture thread
+    return _hook
+
+
+# ---------------------------------------------------------------------------
 # Expiry thread
 # ---------------------------------------------------------------------------
 
@@ -106,6 +137,17 @@ def main(argv: list = None) -> None:
         interface    = args.interface or None,
         bpf_filter   = args.filter,
     )
+
+    # ── Phase 4: attach live inference hook if --live flag set ─────────────
+    if getattr(args, "live", False):
+        try:
+            from ml.live_inference import get_engine
+            from dashboard.dashboard_bridge import bridge_instance
+            engine = get_engine()
+            logger.on_flow_completed = _make_live_hook(engine, bridge_instance, tracker)
+            print("  [OK] Live inference hook attached (PortScan + DoS detection active)")
+        except Exception as exc:
+            print(f"  [WARN] Live inference unavailable: {exc}")
 
     # ── Start all components ──────────────────────────────────────────────
     logger.start()
@@ -201,6 +243,11 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "-q", "--quiet",
         help    = "Suppress per-flow console output",
+        action  = "store_true",
+    )
+    p.add_argument(
+        "--live",
+        help    = "Enable Phase 4 live ML + behavioural detection (PortScan, DoS)",
         action  = "store_true",
     )
     p.add_argument(

@@ -62,6 +62,22 @@ ATTACK_COLOURS = {
     "UNKNOWN"     : "#95a5a6",
 }
 
+SEVERITY_EMOJI = {
+    "NONE"    : "✅",
+    "LOW"     : "🟡",
+    "MEDIUM"  : "🟠",
+    "HIGH"    : "🔴",
+    "CRITICAL": "🚨",
+}
+
+SEVERITY_COLOURS = {
+    "NONE"    : "#27ae60",
+    "LOW"     : "#f39c12",
+    "MEDIUM"  : "#e67e22",
+    "HIGH"    : "#e74c3c",
+    "CRITICAL": "#8e44ad",
+}
+
 
 def _protocol_name(value):
     try:
@@ -147,16 +163,31 @@ st.markdown("---")
 
 if alerts:
     latest = alerts[0]
-    st.error(
-        "**LATEST ALERT — {}** | {} | {}:{} → {}:{} | Reason: {}".format(
-            latest.get("final_decision", "UNKNOWN"),
-            latest.get("timestamp", ""),
-            latest.get("src_ip", "?"),
-            latest.get("src_port", "?"),
-            latest.get("dst_ip", "?"),
-            latest.get("dst_port", "?"),
-            latest.get("detection_reason", "N/A"),
-        )
+    sev    = latest.get("severity", "HIGH" if latest.get("is_attack") else "NONE")
+    emoji  = SEVERITY_EMOJI.get(sev, "🚨")
+    sev_col= SEVERITY_COLOURS.get(sev, "#e74c3c")
+    st.markdown(
+        "<div style='border-left: 6px solid {col}; padding: 10px 16px; "
+        "background: #1a1a1a; border-radius: 6px; margin-bottom: 8px;'>"
+        "<b>{em} {sev} SEVERITY — {label}</b><br/>"
+        "<span style='color:#aaa; font-size:0.9em'>"
+        "{ts} &nbsp;|&nbsp; {src}:{sp} → {dst}:{dp}<br/>"
+        "<i>{reason}</i><br/>"
+        "<b>Action:</b> {action}"
+        "</span></div>".format(
+            col    = sev_col,
+            em     = emoji,
+            sev    = sev,
+            label  = latest.get("final_decision", "UNKNOWN"),
+            ts     = latest.get("timestamp", ""),
+            src    = latest.get("src_ip", "?"),
+            sp     = latest.get("src_port", "?"),
+            dst    = latest.get("dst_ip", "?"),
+            dp     = latest.get("dst_port", "?"),
+            reason = latest.get("detection_reason", "N/A"),
+            action = latest.get("recommended_action", ""),
+        ),
+        unsafe_allow_html=True,
     )
 else:
     st.success("**SYSTEM STATUS** — No malicious traffic detected in the current live session.")
@@ -200,16 +231,28 @@ with tab_live:
         st.subheader("Active Alerts")
         for alert in alerts[:10]:
             label  = alert.get("final_decision", "UNKNOWN")
-            colour = _label_colour(label)
+            sev    = alert.get("severity", "HIGH" if alert.get("is_attack") else "NONE")
+            emoji  = SEVERITY_EMOJI.get(sev, "🚨")
+            colour = SEVERITY_COLOURS.get(sev, _label_colour(label))
+            method = alert.get("detection_method", "")
+            action = alert.get("recommended_action", "")
             st.markdown(
-                "<div style='border-left: 4px solid {}; padding: 6px 12px; "
+                "<div style='border-left: 4px solid {col}; padding: 6px 12px; "
                 "margin-bottom: 6px; background: #1e1e1e; border-radius: 4px;'>"
-                "<b>{}</b> — {} &rarr; {} | {}</div>".format(
-                    colour,
-                    label,
-                    alert.get("src_ip", "?"),
-                    alert.get("dst_ip", "?"),
-                    alert.get("detection_reason", ""),
+                "<b>{em} {sev} — {label}</b> "
+                "<span style='color:#888;font-size:0.85em'>[{method}]</span><br/>"
+                "{src} → {dst} | {reason}<br/>"
+                "<span style='color:#aaa;font-size:0.85em'>{action}</span>"
+                "</div>".format(
+                    col    = colour,
+                    em     = emoji,
+                    sev    = sev,
+                    label  = label,
+                    method = method,
+                    src    = alert.get("src_ip", "?"),
+                    dst    = alert.get("dst_ip", "?"),
+                    reason = alert.get("detection_reason", ""),
+                    action = action,
                 ),
                 unsafe_allow_html=True,
             )

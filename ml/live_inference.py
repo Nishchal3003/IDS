@@ -6,6 +6,8 @@ Combines:
   1. ML classifier     (ml/predict.py :: classify_flow)
   2. PortScanDetector  - sliding-window behavioural port scan detection
   3. SYNFloodDetector  - sliding-window SYN-flood / DoS detection
+  4. ThreatAssessment  - severity + recommended_action
+  5. Async SHAP        - SHAP enrichment submitted to background thread
 
 PortScanDetector is ported verbatim from BSaiCharan-GH/XAI-NIDS ml/live_inference.py.
 SYNFloodDetector and LiveInferenceEngine are completed following the same design
@@ -13,8 +15,17 @@ pattern (the XAI-NIDS source was committed truncated).
 """
 
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 import time
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Async SHAP executor  (one shared thread — SHAP is CPU-bound but we want
+# it non-blocking; a single thread prevents SHAP from saturating the CPU)
+# ---------------------------------------------------------------------------
+
+_shap_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shap")
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +222,53 @@ class SYNFloodDetector:
 
 
 # ---------------------------------------------------------------------------
+# Async SHAP enrichment helper  (runs in _shap_executor thread)
+# ---------------------------------------------------------------------------
+
+def _enrich_with_shap(flow: dict, result: dict) -> None:
+    """
+    Compute SHAP values for an attack flow and write them back to the DB.
+    Called in a background thread — never blocks the capture pipeline.
+
+    Parameters
+    ----------
+    flow   : dict  original feature dict from capture pipeline
+    result : dict  result dict already written to DashboardBridge
+             (mutating top_shap_features here has no effect on the
+              already-persisted row; we write a follow-up DB update)
+    """
+    try:
+        from explainability.shap_explainer import explain_flow
+        shap_features = explain_flow(flow, top_n=10)
+        if not shap_features:
+            return
+
+        # Update the detections table row by matching on timestamp + src_ip
+        import json, sqlite3, os
+        db_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "dashboard", "ids_events.db",
+        )
+        if not os.path.exists(db_path):
+            return
+
+        ts    = result.get("timestamp", "")
+        src   = result.get("src_ip", "")
+        shap_json = json.dumps(shap_features)
+
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            conn.execute(
+                """UPDATE detections SET top_shap_features = ?
+                   WHERE timestamp = ? AND src_ip = ?
+                   AND top_shap_features IN ('{}', '', NULL)
+                   ORDER BY id DESC LIMIT 1""",
+                (shap_json, ts, src),
+            )
+    except Exception:
+        pass   # SHAP failure must never affect detection
+
+
+# ---------------------------------------------------------------------------
 # LiveInferenceEngine  (Phase 4 integration layer)
 # ---------------------------------------------------------------------------
 
@@ -323,7 +381,30 @@ class LiveInferenceEngine:
 
         is_attack = final_decision not in ("BENIGN", "UNKNOWN", "NO_MODEL", "MODEL_ERROR")
 
-        return {
+        # 4. Threat Assessment (fast — pure rule logic, no I/O)
+        try:
+            from ml.threat_assessment import assess
+            threat = assess({
+                "final_decision"       : final_decision,
+                "ml_prediction"        : ml_label,
+                "confidence"           : confidence,
+                "behavioural_detection": behavioural,
+                "is_attack"            : is_attack,
+                "detection_reason"     : reason,
+                "src_ip"               : flow.get("src_ip", ""),
+                "dst_ip"               : flow.get("dst_ip", ""),
+                "src_port"             : flow.get("src_port", 0),
+                "dst_port"             : flow.get("dst_port") or flow.get("Destination Port", 0),
+            })
+        except Exception:
+            threat = {
+                "severity"          : "UNKNOWN",
+                "detection_method"  : "None",
+                "evidence"          : reason,
+                "recommended_action": "",
+            }
+
+        result = {
             "timestamp"            : ts,
             "src_ip"               : flow.get("src_ip", ""),
             "dst_ip"               : flow.get("dst_ip", ""),
@@ -337,7 +418,19 @@ class LiveInferenceEngine:
             "detection_reason"     : reason,
             "is_attack"            : is_attack,
             "probabilities"        : probabilities,
+            # Threat assessment fields
+            "severity"             : threat.get("severity", "NONE"),
+            "detection_method"     : threat.get("detection_method", "None"),
+            "recommended_action"   : threat.get("recommended_action", ""),
+            # SHAP — populated asynchronously
+            "top_shap_features"    : {},
         }
+
+        # 5. Async SHAP enrichment (only for ML-detected attacks with a model)
+        if is_attack and self._ml_is_available() and ml_label not in ("NO_MODEL", "MODEL_ERROR"):
+            _shap_executor.submit(_enrich_with_shap, flow, result)
+
+        return result
 
 
 

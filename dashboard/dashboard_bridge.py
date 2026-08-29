@@ -1,14 +1,13 @@
 """
 dashboard_bridge.py  -  Phase 5 inter-process state bridge.
 Ported and completed from BSaiCharan-GH/XAI-NIDS dashboard/dashboard_bridge.py.
-The XAI-NIDS source was truncated at the migration loop; full implementation here.
 
-Architecture:
-  CaptureLogger (capture thread)
-      -> bridge.update(result_dict)
-  Streamlit dashboard (main thread / separate process)
-      -> bridge.get_snapshot()
-      -> bridge.get_history(n)
+Design: fully in-memory (deque + thread lock) for live state.
+SQLite used only for persistent historical records.
+No temp-file writes: eliminates Windows file-lock races.
+
+Capture thread  ->  bridge.update(result)
+Streamlit thread -> bridge.get_snapshot() / bridge.get_history()
 """
 
 import json
@@ -18,81 +17,82 @@ import threading
 import time
 from collections import deque
 
-BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DB_PATH   = os.path.join(BASE_DIR, "ids_events.db")
-DEFAULT_STATE_PATH = os.path.join(BASE_DIR, "live_state.json")
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "ids_events.db")
 
 
 class DashboardBridge:
     """
-    Inter-process state bridge using in-memory deque + SQLite history.
-    Thread-safe: all public methods acquire self._lock.
+    Thread-safe bridge between the inference/capture pipeline and Streamlit.
+    All live state is in-memory; only attack events are persisted to SQLite.
     """
 
-    def __init__(
-        self,
-        max_live_history = 100,
-        db_path          = DEFAULT_DB_PATH,
-        state_path       = DEFAULT_STATE_PATH,
-    ):
-        self._lock         = threading.Lock()
-        self._max_history  = max_live_history
-        self._db_path      = db_path
-        self._state_path   = state_path
-        self._recent_flows = deque(maxlen=max_live_history)
-        self._alerts       = deque(maxlen=max_live_history)
-        self._counters     = {
+    def __init__(self, max_live_history=100, db_path=DEFAULT_DB_PATH):
+        self._lock          = threading.Lock()
+        self._max_history   = max_live_history
+        self._db_path       = db_path
+        self._recent_flows  = deque(maxlen=max_live_history)
+        self._alerts        = deque(maxlen=max_live_history)
+        self._counters      = {
             "total_packets"  : 0,
             "active_flows"   : 0,
             "port_scan_count": 0,
             "dos_count"      : 0,
         }
-        self._init_db()
+        if db_path != ":memory:":
+            self._init_db()
 
     # ------------------------------------------------------------------ DB
 
     def _init_db(self):
-        with sqlite3.connect(self._db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS detections (
-                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp            TEXT,
-                    src_ip               TEXT,
-                    src_port             INTEGER,
-                    dst_ip               TEXT,
-                    dst_port             INTEGER,
-                    protocol             INTEGER,
-                    ml_prediction        TEXT,
-                    behavioural_detection TEXT,
-                    final_decision       TEXT,
-                    detection_reason     TEXT,
-                    confidence           REAL,
-                    top_shap_features    TEXT
-                )
-            """)
-            # Schema migration: add any missing columns gracefully
-            existing = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(detections)").fetchall()
-            }
-            migrations = {
-                "ml_prediction"        : "TEXT",
-                "behavioural_detection": "TEXT",
-                "final_decision"       : "TEXT",
-                "detection_reason"     : "TEXT",
-                "top_shap_features"    : "TEXT",
-            }
-            for col, col_type in migrations.items():
-                if col not in existing:
-                    conn.execute(
-                        "ALTER TABLE detections ADD COLUMN {} {}".format(col, col_type)
+        """Create detections table if missing, apply schema migrations."""
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS detections (
+                        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp             TEXT,
+                        src_ip                TEXT,
+                        src_port              INTEGER,
+                        dst_ip                TEXT,
+                        dst_port              INTEGER,
+                        protocol              INTEGER,
+                        ml_prediction         TEXT,
+                        behavioural_detection TEXT,
+                        final_decision        TEXT,
+                        detection_reason      TEXT,
+                        confidence            REAL,
+                        top_shap_features     TEXT
                     )
+                """)
+                existing = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(detections)").fetchall()
+                }
+                migrations = {
+                    "ml_prediction"        : "TEXT",
+                    "behavioural_detection": "TEXT",
+                    "final_decision"       : "TEXT",
+                    "detection_reason"     : "TEXT",
+                    "top_shap_features"    : "TEXT",
+                }
+                for col, col_type in migrations.items():
+                    if col not in existing:
+                        conn.execute(
+                            "ALTER TABLE detections ADD COLUMN {} {}".format(col, col_type)
+                        )
+        except Exception as exc:
+            print("[DashboardBridge] DB init error: {}".format(exc))
 
     def _persist_event(self, result):
-        """Write an attack event to SQLite (non-blocking from capture thread)."""
+        """Store an attack event in SQLite (called outside the main lock)."""
+        if self._db_path == ":memory:":
+            return   # skip for in-process test instances
         try:
-            ts = result.get("timestamp", time.time())
-            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            ts     = result.get("timestamp", time.time())
+            ts_str = str(ts) if isinstance(ts, str) else time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(float(ts))
+            )
             with sqlite3.connect(self._db_path) as conn:
                 conn.execute(
                     """
@@ -105,58 +105,57 @@ class DashboardBridge:
                     (
                         ts_str,
                         result.get("src_ip", ""),
-                        result.get("src_port", 0),
+                        int(result.get("src_port") or 0),
                         result.get("dst_ip", ""),
-                        result.get("dst_port", 0),
-                        result.get("protocol", 0),
+                        int(result.get("dst_port") or 0),
+                        int(result.get("protocol") or 0),
                         result.get("ml_prediction", ""),
-                        result.get("behavioural_detection", ""),
+                        result.get("behavioural_detection") or "",
                         result.get("final_decision", ""),
                         result.get("detection_reason", ""),
-                        result.get("confidence", 0.0),
+                        float(result.get("confidence") or 0.0),
                         json.dumps(result.get("top_shap_features", {})),
                     ),
                 )
-        except Exception:
-            pass  # never let DB error crash the capture thread
+        except Exception as exc:
+            print("[DashboardBridge] SQLite persist error: {}".format(exc))
 
     # ------------------------------------------------------------------ Public API
 
     def update(self, result: dict, packet_count: int = 1, active_flows: int = 0):
         """
-        Called by the LiveInferenceEngine callback for every completed flow.
-
-        Parameters
-        ----------
-        result       : dict from LiveInferenceEngine.process_flow()
-        packet_count : increment for total packet counter
-        active_flows : current active flow count from FlowTracker
+        Called by LiveInferenceEngine for every completed flow.
+        Updates in-memory state atomically; persists attacks to SQLite.
         """
+        is_attack = result.get("is_attack", False)
+        final     = result.get("final_decision", "")
+
         with self._lock:
+            # Normalise timestamp to string for display
             ts = result.get("timestamp", time.time())
-            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-            result["timestamp"] = ts_str
+            if isinstance(ts, (int, float)):
+                result = dict(result)   # don't mutate caller's dict
+                result["timestamp"] = time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(ts)
+                )
 
             self._recent_flows.append(result)
             self._counters["total_packets"] += packet_count
             self._counters["active_flows"]   = active_flows
 
-            final = result.get("final_decision", "")
-            if result.get("is_attack"):
+            if is_attack:
                 self._alerts.appendleft(result)
                 if final == "PortScan":
                     self._counters["port_scan_count"] += 1
                 elif final in ("DoS", "DDoS", "DoS_SYNFlood"):
                     self._counters["dos_count"] += 1
 
-        # Persist attacks to SQLite (outside lock to minimise hold time)
-        if result.get("is_attack"):
+        # Persist outside lock to minimise hold time
+        if is_attack:
             self._persist_event(result)
 
     def get_snapshot(self) -> dict:
-        """
-        Return the current live state snapshot consumed by the Streamlit dashboard.
-        """
+        """Return the current live state (in-memory, thread-safe)."""
         with self._lock:
             return {
                 "recent_flows"   : list(self._recent_flows),
@@ -168,7 +167,9 @@ class DashboardBridge:
             }
 
     def get_history(self, limit: int = 500) -> list:
-        """Return historical detections from SQLite."""
+        """Return historical attack detections from SQLite."""
+        if self._db_path == ":memory:":
+            return []
         try:
             with sqlite3.connect(self._db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -176,12 +177,13 @@ class DashboardBridge:
                     "SELECT * FROM detections ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
-                return [dict(r) for r in rows]
-        except Exception:
+                return [dict(row) for row in rows]
+        except Exception as exc:
+            print("[DashboardBridge] History error: {}".format(exc))
             return []
 
     def reset_counters(self):
-        """Reset live counters (called at dashboard start or on user request)."""
+        """Reset live counters and alert list without deleting historical records."""
         with self._lock:
             self._counters = {
                 "total_packets"  : 0,
@@ -194,7 +196,7 @@ class DashboardBridge:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton  (used by both capture thread and Streamlit)
+# Module-level singleton  (used by capture thread and Streamlit in same process)
 # ---------------------------------------------------------------------------
 
 bridge_instance = DashboardBridge()

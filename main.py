@@ -81,10 +81,13 @@ def main() -> None:
             os.path.dirname(os.path.abspath(__file__)),
             "dashboard", "dashboard.py",
         )
-        subprocess.run(
-            [sys.executable, "-m", "streamlit", "run", dashboard_path],
-            check=False,
-        )
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "streamlit", "run", dashboard_path],
+                check=False,
+            )
+        except KeyboardInterrupt:
+            print("\nDashboard stopped.")
 
     elif command == "mock":
         from dashboard.mock_traffic_generator import run_mock

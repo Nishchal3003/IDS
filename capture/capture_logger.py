@@ -106,6 +106,16 @@ class CaptureLogger:
     def rows_written(self) -> int:
         return self._rows_written
 
+    @property
+    def on_flow_completed(self) -> Optional[Callable]:
+        """Phase 4 live inference callback. Set to wire the detection engine."""
+        return self._on_flow
+
+    @on_flow_completed.setter
+    def on_flow_completed(self, callback: Optional[Callable]) -> None:
+        """Attach (or replace) the flow-completion callback at any time."""
+        self._on_flow = callback
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

@@ -22,7 +22,7 @@ import streamlit as st
 # Add project root to path so imports work when run directly
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dashboard.dashboard_bridge import bridge_instance
+from dashboard_bridge import bridge_instance
 
 
 # ---------------------------------------------------------------------------

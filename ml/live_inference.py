@@ -291,22 +291,31 @@ class LiveInferenceEngine:
         ps = self.port_scan_detector.process_flow(flow)
         sf = self.syn_flood_detector.process_flow(flow)
 
+        # Detect behavioural threats — suppressed means "alert already sent, don't spam"
+        # but the attack is still ongoing. We include it in the result either way.
+        ps_detected = ps.get("detected", False)
+        sf_detected = sf.get("detected", False)
+        ps_suppressed = ps.get("suppressed", False)
+        sf_suppressed = sf.get("suppressed", False)
+
         behavioural = None
-        if ps.get("detected") and not ps.get("suppressed"):
-            behavioural = "PortScan"
-        elif sf.get("detected") and not sf.get("suppressed"):
+        if ps_detected:
+            behavioural = "PortScan"        # include suppressed — attack is ongoing
+        elif sf_detected:
             behavioural = "DoS_SYNFlood"
 
         # 3. Final decision  (behavioural overrides ML when triggered)
         if behavioural == "PortScan":
             final_decision = "PortScan"
-            reason = "Behavioural PortScan: {} unique ports in {} flows".format(
-                ps.get("unique_ports", 0), ps.get("connections", 0)
+            reason = "Behavioural PortScan: {} unique ports in {} flows{}".format(
+                ps.get("unique_ports", 0), ps.get("connections", 0),
+                " [cooldown]" if ps_suppressed else "",
             )
         elif behavioural == "DoS_SYNFlood":
             final_decision = "DoS"
-            reason = "Behavioural SYNFlood: {:.0f} SYN, ACK ratio={:.2f}".format(
-                sf.get("total_syn", 0), sf.get("ack_ratio", 0)
+            reason = "Behavioural SYNFlood: {:.0f} SYN, ACK ratio={:.2f}{}".format(
+                sf.get("total_syn", 0), sf.get("ack_ratio", 0),
+                " [cooldown]" if sf_suppressed else "",
             )
         else:
             final_decision = ml_label
@@ -329,6 +338,7 @@ class LiveInferenceEngine:
             "is_attack"            : is_attack,
             "probabilities"        : probabilities,
         }
+
 
 
 # ---------------------------------------------------------------------------

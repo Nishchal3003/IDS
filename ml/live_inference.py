@@ -259,10 +259,11 @@ def _enrich_with_shap(flow: dict, result: dict) -> None:
         with sqlite3.connect(db_path, timeout=10.0) as conn:
             conn.execute(
                 """UPDATE detections SET top_shap_features = ?
-                   WHERE timestamp = ? AND src_ip = ?
-                   AND top_shap_features IN ('{}', '', NULL)
-                   ORDER BY id DESC LIMIT 1""",
-                (shap_json, ts, src),
+                   WHERE id = (
+                       SELECT MAX(id) FROM detections
+                       WHERE src_ip = ? AND top_shap_features IN ('{}', '', NULL)
+                   )""",
+                (shap_json, src),
             )
     except Exception:
         pass   # SHAP failure must never affect detection

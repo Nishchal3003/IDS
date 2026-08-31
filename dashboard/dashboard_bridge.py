@@ -112,7 +112,10 @@ class DashboardBridge:
                         final_decision        TEXT,
                         detection_reason      TEXT,
                         confidence            REAL,
-                        top_shap_features     TEXT
+                        top_shap_features     TEXT,
+                        severity              TEXT,
+                        detection_method      TEXT,
+                        recommended_action    TEXT
                     )
                 """)
                 # Schema migrations for older DB files
@@ -133,6 +136,9 @@ class DashboardBridge:
                     "final_decision"       : "TEXT",
                     "detection_reason"     : "TEXT",
                     "top_shap_features"    : "TEXT",
+                    "severity"             : "TEXT",
+                    "detection_method"     : "TEXT",
+                    "recommended_action"   : "TEXT",
                 }
                 for col, col_type in det_migrations.items():
                     if col not in existing_det:
@@ -222,8 +228,9 @@ class DashboardBridge:
                     INSERT INTO detections
                         (timestamp, src_ip, src_port, dst_ip, dst_port, protocol,
                          ml_prediction, behavioural_detection, final_decision,
-                         detection_reason, confidence, top_shap_features)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                         detection_reason, confidence, top_shap_features,
+                         severity, detection_method, recommended_action)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         result.get("timestamp", ""),
@@ -237,7 +244,10 @@ class DashboardBridge:
                         result.get("final_decision", ""),
                         result.get("detection_reason", ""),
                         float(result.get("confidence") or 0.0),
-                        json.dumps(result.get("top_shap_features", {})),
+                        json.dumps(result.get("top_shap_features") or {}),
+                        result.get("severity", ""),
+                        result.get("detection_method", ""),
+                        result.get("recommended_action", ""),
                     ),
                 )
         except Exception as exc:

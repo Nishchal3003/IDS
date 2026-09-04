@@ -5,14 +5,14 @@ Intelligent-NIDS  top-level entry point.
 
 Usage
 -----
-  python main.py server            Start the communication server
-  python main.py client            Start an interactive client terminal
-  python main.py capture           Packet capture daemon (Phase 2)
-  python main.py capture --live    Capture + live PortScan/DoS detection (Phase 4)
-  python main.py train             Train ML models (Phase 3)
-  python main.py evaluate          Evaluate trained model + generate reports (Phase 3)
-  python main.py dashboard         Start Streamlit monitoring dashboard (Phase 5)
-  python main.py mock [seconds]    Run mock traffic to test detection + dashboard
+  python main.py nids              Start NIDS server (all-in-one: comm + capture + dashboard)
+  python main.py client            Start an interactive client terminal (auto-discovers server)
+  python main.py server            Start communication server only
+  python main.py capture --live    Capture + live detection only
+  python main.py dashboard         Start Streamlit dashboard only
+  python main.py mock [seconds]    Run mock traffic (dev/testing)
+  python main.py train             Train ML models
+  python main.py evaluate          Evaluate trained model
 """
 
 import sys
@@ -23,27 +23,22 @@ def print_usage() -> None:
 Intelligent Network Intrusion Detection System
 ===============================================
 
-Usage:
-  python main.py server              Start the NIDS communication server
-  python main.py client              Start an interactive client terminal
+QUICK START:
+  NIDS Server machine:
+    python main.py nids              All-in-one: comm server + capture + dashboard
 
-  python main.py capture             Start packet capture (Phase 2)
-  python main.py capture --live      Capture + live PortScan/DoS detection (Phase 4)
-  python main.py capture --list      List available network interfaces
-  python main.py capture --help      All capture options
+  Client machine (any LAN device):
+    python main.py client            Auto-discovers server, no IP needed
 
-  python main.py train               Train ML intrusion detection models (Phase 3)
-  python main.py evaluate            Evaluate + generate reports (Phase 3)
-
-  python main.py dashboard           Start Streamlit monitoring dashboard (Phase 5)
-  python main.py mock [seconds]      Simulate traffic to test detection + dashboard
-
-Phase 1: Communication Network   [DONE]
-Phase 2: Packet Capture          [DONE]
-Phase 3: ML Pipeline             [DONE]
-Phase 4: Real-time Detection     [DONE  use: capture --live]
-Phase 5: Dashboard               [DONE  use: dashboard]
-Phase 6: XAI / SHAP              [DONE  auto in dashboard when shap installed]
+ALL COMMANDS:
+  python main.py nids              NIDS server (all-in-one)
+  python main.py client            Interactive client (auto-discover)
+  python main.py server            Communication server only
+  python main.py capture --live    Packet capture + live detection only
+  python main.py dashboard         Streamlit dashboard only
+  python main.py mock [seconds]    Mock traffic for dev/testing
+  python main.py train             Train ML models
+  python main.py evaluate          Evaluate + generate reports
 """)
 
 
@@ -54,7 +49,11 @@ def main() -> None:
 
     command = sys.argv[1].lower()
 
-    if command == "server":
+    if command == "nids":
+        from communication.nids_launcher import run_nids_server
+        run_nids_server()
+
+    elif command == "server":
         from communication.server import main as server_main
         server_main()
 

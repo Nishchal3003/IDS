@@ -120,18 +120,43 @@ dos_min_syn   = st.sidebar.slider("DoS: min SYN packets", 10, 100, 20)
 st.sidebar.caption("Changes take effect on next capture restart.")
 
 if st.sidebar.button("Reset Live Counters"):
-    bridge_instance.reset_counters()
-    st.sidebar.success("Counters reset.")
+    try:
+        bridge_instance.reset_counters()
+        st.sidebar.success("Counters reset.")
+    except Exception as _e:
+        st.sidebar.error(f"Reset failed: {_e}")
 
 
 # ---------------------------------------------------------------------------
-# Fetch live state
+# Fetch live state  (crash-proof: bad DB read returns safe empty state)
 # ---------------------------------------------------------------------------
 
-snapshot     = bridge_instance.get_snapshot()
+_EMPTY_SNAPSHOT = {
+    "recent_flows"   : [],
+    "alerts"         : [],
+    "total_packets"  : 0,
+    "active_flows"   : 0,
+    "port_scan_count": 0,
+    "dos_count"      : 0,
+}
+
+try:
+    snapshot = bridge_instance.get_snapshot()
+except Exception:
+    snapshot = _EMPTY_SNAPSHOT.copy()
+
 recent_flows = snapshot.get("recent_flows", [])
 alerts       = snapshot.get("alerts", [])
 counts       = _decision_counts(recent_flows)
+
+# Sidebar live-status indicator (placed here because it needs recent_flows)
+st.sidebar.markdown("---")
+if recent_flows:
+    st.sidebar.success("Live data")
+elif alerts:
+    st.sidebar.success("Live data (alerts)")
+else:
+    st.sidebar.warning("Waiting for capture...")
 
 
 # ---------------------------------------------------------------------------
@@ -662,9 +687,12 @@ with tab_history:
 
 
 # ---------------------------------------------------------------------------
-# Auto-refresh
+# Auto-refresh  (survives exceptions so frontend never permanently freezes)
 # ---------------------------------------------------------------------------
 
 if auto_refresh:
     time.sleep(refresh_rate)
-    st.rerun()
+    try:
+        st.rerun()
+    except Exception:
+        pass   # Streamlit version compatibility guard

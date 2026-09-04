@@ -95,6 +95,9 @@ class MsgType(str, Enum):
     SERVER_FULL = "SERVER_FULL"  # server is at MAX_CLIENTS capacity
     ACK         = "ACK"          # generic acknowledgement
 
+    # Security testing  (experiment metadata only — NOT the detection signal)
+    SECURITY_TEST = "SECURITY_TEST"  # client → server: controlled test started/done
+
 
 # ---------------------------------------------------------------------------
 # Trust-score thresholds  (used later by the IDS trust engine)

@@ -178,14 +178,15 @@ class ClientSession:
     # ------------------------------------------------------------------
     def _dispatch(self, frame: Frame) -> None:
         handlers = {
-            MsgType.HELLO     : self._handle_hello,
-            MsgType.PING      : self._handle_ping,
-            MsgType.PONG      : self._handle_pong,
-            MsgType.CHAT      : self._handle_chat,
-            MsgType.FILE_META : self._handle_file_meta,
-            MsgType.FILE_CHUNK: self._handle_file_chunk,
-            MsgType.FILE_DONE : self._handle_file_done,
-            MsgType.DISCONNECT: self._handle_disconnect,
+            MsgType.HELLO        : self._handle_hello,
+            MsgType.PING         : self._handle_ping,
+            MsgType.PONG         : self._handle_pong,
+            MsgType.CHAT         : self._handle_chat,
+            MsgType.SECURITY_TEST: self._handle_security_test,
+            MsgType.FILE_META    : self._handle_file_meta,
+            MsgType.FILE_CHUNK   : self._handle_file_chunk,
+            MsgType.FILE_DONE    : self._handle_file_done,
+            MsgType.DISCONNECT   : self._handle_disconnect,
         }
         handler = handlers.get(frame.msg_type)
         if handler:
@@ -248,6 +249,36 @@ class ClientSession:
             extra={"from": self.alias, "time": timestamp_to_str(frame.timestamp)},
         )
         self._server.broadcast(relay, exclude=None)   # echo back to sender too
+
+    def _handle_security_test(self, frame: Frame) -> None:
+        """Relay security-test metadata as a broadcast (for experiment logging only).
+
+        The NIDS does NOT use this frame for detection — detection comes from
+        real captured packets, not from this announcement.
+        """
+        test_type = frame.extra.get("test_type", "UNKNOWN")
+        target    = frame.extra.get("target", "?")
+        status    = frame.extra.get("status", "started")   # "started" | "done"
+        log.info(
+            "[SECURITY_TEST] %s: %s → %s (%s)",
+            self.alias, test_type, target, status,
+        )
+        notice = build_text_frame(
+            MsgType.BROADCAST,
+            "server",
+            "[Security Test] {} — {} test {} by {}".format(
+                status.upper(), test_type, status, self.alias,
+            ),
+            extra={
+                "from"     : "server",
+                "time"     : timestamp_to_str(frame.timestamp),
+                "test_type": test_type,
+                "target"   : target,
+                "status"   : status,
+                "initiator": self.alias,
+            },
+        )
+        self._server.broadcast(notice, exclude=None)
 
     def _handle_file_meta(self, frame: Frame) -> None:
         file_name   = frame.extra.get("file_name", "unknown")

@@ -5,15 +5,19 @@ Interactive CLI client for the NIDS private communication network.
 
 Run on any machine connected to the same LAN as the server:
 
-    python -m communication.client
+    python main.py client
     OR
-    python communication/client.py
+    python -m communication.client
 
-The CLI provides a simple text menu:
+The client auto-discovers the NIDS server on the LAN via UDP broadcast.
+No IP address needs to be typed in normal use.
+
+Menu:
     [1] Send chat message
     [2] Send file
     [3] List peers
-    [4] Disconnect
+    [4] Disconnect and exit
+    [5] Security Testing (PortScan / DoS)
 
 All incoming frames are printed to the console in real time.
 """
@@ -28,9 +32,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from communication.client_core import NIDSClient
 from communication.constants import MsgType
+from communication.discovery import find_server
 from communication.logger import get_logger
-from communication.protocol import Frame
-from communication.utils import get_local_ip, sanitise_alias, timestamp_to_str
+from communication.protocol import Frame, build_text_frame
+from communication.utils import get_local_ip, sanitise_alias, timestamp_to_str, safe_send
 
 try:
     from config.network_config import PORT
@@ -61,10 +66,17 @@ def display_frame(frame: Frame) -> None:
 
     if frame.msg_type == MsgType.BROADCAST:
         sender = frame.extra.get("from", frame.sender)
-        colour_print(
-            f"\n  [{ts}] {BOLD}{sender}{RESET}{CYAN}: {frame.text}",
-            CYAN,
-        )
+        # Security test announcements get a distinct marker
+        if frame.extra.get("test_type"):
+            colour_print(
+                f"\n  [{ts}] SECURITY TEST  {sender}: {frame.text}",
+                YELLOW,
+            )
+        else:
+            colour_print(
+                f"\n  [{ts}] {BOLD}{sender}{RESET}{CYAN}: {frame.text}",
+                CYAN,
+            )
 
     elif frame.msg_type == MsgType.WELCOME:
         peers = frame.extra.get("peers", [])
@@ -85,7 +97,7 @@ def display_frame(frame: Frame) -> None:
         colour_print(f"\n  [{ts}] [ERR] {frame.text}", RED)
 
     elif frame.msg_type in (MsgType.PING, MsgType.PONG):
-        pass   # silent keep-alive – don't clutter the terminal
+        pass   # silent keep-alive
 
 
 def display_disconnected(reason: str) -> None:
@@ -111,6 +123,7 @@ def print_menu() -> None:
     {GREEN}[2]{RESET} Send file
     {GREEN}[3]{RESET} List online peers
     {GREEN}[4]{RESET} Disconnect and exit
+    {GREEN}[5]{RESET} Security Testing
     {GREEN}[q]{RESET} Disconnect and exit
 """)
 
@@ -126,12 +139,157 @@ def get_alias() -> str:
             colour_print(f"  Invalid alias: {exc}", RED)
 
 
-def get_server_ip() -> str:
+def get_server_address() -> tuple:
+    """
+    Auto-discover NIDS server via UDP broadcast.
+    Falls back to manual IP entry if no server is found within 5 seconds.
+
+    Returns (ip: str, port: int).
+    """
+    colour_print("\n  Scanning LAN for NIDS server (5 seconds)...", YELLOW)
+    result = find_server(timeout=5.0)
+
+    if result:
+        ip, port = result
+        colour_print(f"  [AUTO] Found NIDS server at {ip}:{port}", GREEN)
+        confirm = input(
+            f"  {CYAN}Press ENTER to connect, or type a different IP:{RESET} "
+        ).strip()
+        if confirm:
+            ip = confirm
+        port_str = input(
+            f"  {CYAN}Port [{port}]:{RESET} "
+        ).strip()
+        port = int(port_str) if port_str.isdigit() else port
+        return ip, port
+
+    colour_print("  [!] No server found automatically.", YELLOW)
+    colour_print("  Make sure the server is running: python main.py nids", YELLOW)
     local = get_local_ip()
-    raw = input(
-        f"  {CYAN}Server IP address [{local}]:{RESET} "
-    ).strip()
-    return raw if raw else local
+    raw = input(f"  {CYAN}Server IP address [{local}]:{RESET} ").strip()
+    ip = raw if raw else local
+    port_str = input(f"  {CYAN}Server port [{PORT}]:{RESET} ").strip()
+    port = int(port_str) if port_str.isdigit() else PORT
+    return ip, port
+
+
+# ---------------------------------------------------------------------------
+# Security testing sub-menu
+# ---------------------------------------------------------------------------
+
+def _send_security_test_frame(client: NIDSClient, test_type: str,
+                               target: str, status: str) -> None:
+    """Broadcast SECURITY_TEST metadata frame (experiment logging only)."""
+    try:
+        frame = build_text_frame(
+            MsgType.SECURITY_TEST,
+            client.alias,
+            f"{test_type} {status}",
+            extra={
+                "test_type": test_type,
+                "target"   : target,
+                "status"   : status,
+            },
+        )
+        safe_send(client._sock, frame)
+    except Exception:
+        pass   # metadata failure must never abort the test
+
+
+def _run_portscan(client: NIDSClient, target: str) -> None:
+    """Run PortScan test synchronously with live progress output."""
+    try:
+        from attacks.portscan_test import run_portscan, _is_private, _print_banner
+        import argparse
+    except ImportError:
+        colour_print("  [ERR] attacks/portscan_test.py not found.", RED)
+        return
+
+    if not _is_private(target):
+        colour_print(f"  [ERR] {target} is not a private/LAN IP. Aborting.", RED)
+        return
+
+    colour_print(f"\n  Starting PortScan test -> {target}", YELLOW)
+    _send_security_test_frame(client, "PortScan", target, "started")
+
+    try:
+        ns = argparse.Namespace(
+            target=target, port_from=20, port_to=120,
+            rate=200, ports=None,
+        )
+        _print_banner(ns)
+        run_portscan(target=target, port_from=20, port_to=120, rate=200, verbose=True)
+    except Exception as exc:
+        colour_print(f"  [ERR] PortScan error: {exc}", RED)
+
+    _send_security_test_frame(client, "PortScan", target, "done")
+    colour_print("\n  [OK] PortScan complete. Check dashboard for alerts.", GREEN)
+    colour_print("       http://localhost:8501", CYAN)
+
+
+def _run_dos(client: NIDSClient, target: str) -> None:
+    """Run DoS test synchronously with live progress output."""
+    try:
+        from attacks.dos_test import run_dos_test, _is_private, _print_banner
+        import argparse
+    except ImportError:
+        colour_print("  [ERR] attacks/dos_test.py not found.", RED)
+        return
+
+    if not _is_private(target):
+        colour_print(f"  [ERR] {target} is not a private/LAN IP. Aborting.", RED)
+        return
+
+    colour_print(f"\n  Starting DoS test -> {target}:5000", YELLOW)
+    _send_security_test_frame(client, "DoS", target, "started")
+
+    try:
+        ns = argparse.Namespace(
+            target=target, port=5000, rate=150, duration=10,
+        )
+        _print_banner(ns)
+        run_dos_test(target=target, port=5000, rate=150, duration=10, verbose=True)
+    except Exception as exc:
+        colour_print(f"  [ERR] DoS error: {exc}", RED)
+
+    _send_security_test_frame(client, "DoS", target, "done")
+    colour_print("\n  [OK] DoS test complete. Check dashboard for alerts.", GREEN)
+    colour_print("       http://localhost:8501", CYAN)
+
+
+def handle_security_testing(client: NIDSClient, server_ip: str) -> None:
+    """Security testing sub-menu. Target defaults to the connected server IP."""
+    target = server_ip
+
+    print(f"""
+{BOLD}  Security Testing{RESET}
+  Target : {CYAN}{target}{RESET}  (NIDS server on the same LAN)
+  Note   : Detection comes from REAL PACKETS captured by the server,
+           not from this menu selection.
+
+    {GREEN}[a]{RESET} PortScan Test
+    {GREEN}[b]{RESET} DoS Test
+    {GREEN}[c]{RESET} Both (PortScan then DoS)
+    {GREEN}[x]{RESET} Back to main menu
+""")
+    try:
+        choice = input(f"  {BOLD}>{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    if choice == "a":
+        _run_portscan(client, target)
+    elif choice == "b":
+        _run_dos(client, target)
+    elif choice == "c":
+        _run_portscan(client, target)
+        colour_print("\n  Waiting 5s before DoS test...", YELLOW)
+        time.sleep(5)
+        _run_dos(client, target)
+    elif choice in ("x", ""):
+        return
+    else:
+        colour_print("  Unknown option.", YELLOW)
 
 
 # ---------------------------------------------------------------------------
@@ -141,12 +299,8 @@ def main() -> None:
     """Run the interactive client CLI."""
     print_banner()
 
-    alias     = get_alias()
-    server_ip = get_server_ip()
-    server_port_str = input(
-        f"  {CYAN}Server port [{PORT}]:{RESET} "
-    ).strip()
-    server_port = int(server_port_str) if server_port_str.isdigit() else PORT
+    alias = get_alias()
+    server_ip, server_port = get_server_address()
 
     client = NIDSClient(
         alias=alias,
@@ -208,6 +362,9 @@ def main() -> None:
                     colour_print(f"    • {p}", CYAN)
             else:
                 colour_print("  No other peers online.", YELLOW)
+
+        elif choice == "5":
+            handle_security_testing(client, server_ip)
 
         else:
             colour_print("  Unknown command.", YELLOW)
